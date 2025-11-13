@@ -8,6 +8,9 @@ clean:
 build:
 	$(CMD) build . -bt amigaos_docker -fld -maxOneError
 
+build-macos-arm:
+	$(CMD) build . -bt macos-arm -fld -maxOneError
+
 build-rl:
 	$(CMD) build . -bt amigaos_docker -rl
 

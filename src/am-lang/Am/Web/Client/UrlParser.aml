@@ -1,15 +1,16 @@
 namespace Am.Web.Client {
     class UrlParser {
         import Am.Lang
-        
-        fun constructor() {
-        }
-        
+                
         fun extractHost(url: String): String {
             var urlCopy = url
             
             // Remove protocol if present
             if (urlCopy.startsWith("http://")) {
+                urlCopy = urlCopy.substring(7UI, (urlCopy.length() - 7).toUInt())
+            } else if (urlCopy.startsWith("https://")) {
+                urlCopy = urlCopy.substring(8UI, (urlCopy.length() - 8).toUInt())
+            } else if (urlCopy.startsWith("http://")) {
                 urlCopy = urlCopy.substring(7UI, (urlCopy.length() - 7).toUInt())
             } else if (urlCopy.startsWith("https://")) {
                 urlCopy = urlCopy.substring(8UI, (urlCopy.length() - 8).toUInt())

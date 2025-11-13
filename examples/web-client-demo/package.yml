@@ -29,6 +29,8 @@ platforms:
       - -noixemul     
     gccAdditionalLibraries:
       - socket
+      - amisslstubs
+      - amisslauto
   - id: macos
     extends: libc
     gccCommand: gcc -O3

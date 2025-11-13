@@ -4,19 +4,25 @@ namespace Am.Web.Client {
         import Am.Net
         import Am.Net.Ssl
         import Am.IO
-        
-        fun constructor() {
-        }
-               
-        fun get(url: String): String {
+        import Am.Collections
+                       
+        fun get(url: String): HttpResponse {
             return this.makeRequest("GET", url, "")
         }
         
-        fun post(url: String, data: String): String {
+        fun post(url: String, data: String): HttpResponse {
             return this.makeRequest("POST", url, data)
         }
         
-        private fun makeRequest(method: String, url: String, data: String): String {
+        fun put(url: String, data: String): HttpResponse {
+            return this.makeRequest("PUT", url, data)
+        }
+        
+        fun delete(url: String): HttpResponse {
+            return this.makeRequest("DELETE", url, "")
+        }
+        
+        private fun makeRequest(method: String, url: String, data: String): HttpResponse {
             var parser = new UrlParser()
             var host = parser.extractHost(url)
             var path = parser.extractPath(url)
@@ -53,9 +59,109 @@ namespace Am.Web.Client {
             ts.writeString(request)
             
             // Read response
-            var response = ts.readString()
-            s.close()          
-            return response
+            var rawResponse = ts.readString()
+            s.close()
+            
+            // Parse HTTP response
+            return this.parseHttpResponse(rawResponse)
+        }
+        
+        private fun parseHttpResponse(rawResponse: String): HttpResponse {
+            if (rawResponse.length() == 0) {
+                var emptyHeaders = new HashMap<String, String>()
+                return new HttpResponse(0, "No Response", emptyHeaders, "")
+            }
+            
+            // Find the end of the status line
+            var firstLineEnd = rawResponse.indexOf("\n")
+            if (firstLineEnd < 0) {
+                var emptyHeaders = new HashMap<String, String>()
+                return new HttpResponse(0, "Invalid Response", emptyHeaders, rawResponse)
+            }
+            
+            // Parse status line (HTTP/1.1 200 OK)
+            var statusLine = rawResponse.substring(0UI, firstLineEnd.toUInt())
+            if (statusLine.endsWith("\r")) {
+                statusLine = statusLine.substring(0UI, (statusLine.length() - 1).toUInt())
+            }
+            
+            var statusParts: Array<String> = statusLine.splitByString(" ")
+            var statusCode = 200
+            var statusMessage = "OK"
+            
+            if (statusParts.length() >= 2) {
+                var statusCodeStr: String = statusParts[1]
+                statusCode = Int.parse(statusCodeStr)
+            }
+            if (statusParts.length() >= 3) {
+                statusMessage = statusParts[2]
+                // Join remaining parts for multi-word status messages
+                var i = 3
+                while (i < statusParts.length()) {
+                    var nextPart: String = statusParts[i]
+                    statusMessage = statusMessage + " " + nextPart
+                    i = i + 1
+                }
+            }
+            
+            // Find the end of headers (double CRLF)
+            var headersEnd = rawResponse.indexOf("\r\n\r\n")
+            if (headersEnd < 0) {
+                headersEnd = rawResponse.indexOf("\n\n")
+                if (headersEnd < 0) {
+                    var emptyHeaders = new HashMap<String, String>()
+                    return new HttpResponse(statusCode, statusMessage, emptyHeaders, "")
+                }
+                headersEnd = headersEnd + 2
+            } else {
+                headersEnd = headersEnd + 4
+            }
+            
+            // Parse headers
+            var headers = new HashMap<String, String>()
+            var headerStart = firstLineEnd + 1
+            var headerLength = headersEnd - headerStart - 2
+            if (headerLength < 0 || headerStart >= rawResponse.length()) {
+                headerLength = 0
+            }
+            if (headerStart + headerLength > rawResponse.length()) {
+                headerLength = rawResponse.length() - headerStart
+            }
+            var headerSection = ""
+            if (headerLength > 0) {
+                headerSection = rawResponse.substring(headerStart.toUInt(), headerLength.toUInt())
+            }
+            var headerLines: Array<String> = headerSection.splitByString("\n")
+            
+            var h = 0
+            while (h < headerLines.length()) {
+                var headerLine: String = headerLines[h]
+                
+                // Skip empty lines (end of headers)
+                if (headerLine.length() == 0 || (headerLine.length() == 1 && headerLine.endsWith("\r"))) {
+                    break
+                }
+                
+                if (headerLine.endsWith("\r")) {
+                    headerLine = headerLine.substring(0UI, (headerLine.length() - 1).toUInt())
+                }
+                
+                var colonIndex: Int = headerLine.indexOf(":")
+                if (colonIndex > 0) {
+                    var headerName: String = headerLine.substring(0UI, colonIndex.toUInt()).trim()
+                    var headerValue: String = headerLine.substring((colonIndex + 1).toUInt(), (headerLine.length() - (colonIndex + 1)).toUInt()).trim()
+                    headers.set(headerName, headerValue)
+                }
+                h = h + 1
+            }
+            
+            // Extract body
+            var body = ""
+            if (headersEnd < rawResponse.length()) {
+                body = rawResponse.substring(headersEnd.toUInt(), (rawResponse.length() - headersEnd).toUInt())
+            }
+            
+            return new HttpResponse(statusCode, statusMessage, headers, body)
         }
     }
 }
