@@ -1,0 +1,86 @@
+namespace Am.Web.Client {
+    class UrlParser {
+        import Am.Lang
+        
+        fun constructor() {
+        }
+        
+        fun extractHost(url: String): String {
+            var urlCopy = url
+            
+            // Remove protocol if present
+            if (urlCopy.startsWith("http://")) {
+                urlCopy = urlCopy.substring(7UI, (urlCopy.length() - 7).toUInt())
+            } else if (urlCopy.startsWith("https://")) {
+                urlCopy = urlCopy.substring(8UI, (urlCopy.length() - 8).toUInt())
+            }
+           
+            // Find first slash using indexOf
+            var slashIndex = urlCopy.indexOf("/")
+            var colonIndex = urlCopy.indexOf(":")
+            
+            var endIndex = urlCopy.length()
+            
+            // Use the first delimiter found
+            if (slashIndex >= 0 && (colonIndex < 0 || slashIndex < colonIndex)) {
+                endIndex = slashIndex
+            } else if (colonIndex >= 0) {
+                endIndex = colonIndex
+            }
+            
+            return urlCopy.substring(0UI, endIndex.toUInt())
+        }
+        
+        fun extractPort(url: String): Int {
+            var urlCopy = url
+
+            var defaultPort = 80
+            if (urlCopy.startsWith("http://")) {
+                urlCopy = urlCopy.substring(7UI, (urlCopy.length() - 7).toUInt())
+                defaultPort = 80
+            } else if (urlCopy.startsWith("https://")) {
+                urlCopy = urlCopy.substring(8UI, (urlCopy.length() - 8).toUInt())
+                defaultPort = 443
+            }
+
+            // Look for port number after colon
+            var colonIndex = urlCopy.indexOf(":")
+            var slashIndex = urlCopy.indexOf("/")
+            
+            if (colonIndex >= 0) {
+                var endIndex = urlCopy.length()
+                if (slashIndex >= 0) {
+                    endIndex = slashIndex
+                }
+                var portStr = urlCopy.substring((colonIndex + 1).toUInt(), (endIndex - (colonIndex + 1)).toUInt())
+                return Int.parse(portStr)
+            }
+            
+            return defaultPort
+        }
+        
+        fun extractPath(url: String): String {
+            var urlCopy = url
+            
+            // Remove protocol if present
+            if (urlCopy.startsWith("http://")) {
+                urlCopy = urlCopy.substring(7UI, (urlCopy.length() - 7).toUInt())
+            } else if (urlCopy.startsWith("https://")) {
+                urlCopy = urlCopy.substring(8UI, (urlCopy.length() - 8).toUInt())
+            }
+            
+            // Find first slash (start of path)
+            var slashIndex = urlCopy.indexOf("/")
+            
+            if (slashIndex >= 0) {
+                return urlCopy.substring(slashIndex.toUInt(), (urlCopy.length() - slashIndex).toUInt())
+            } else {
+                return "/"
+            }
+        }
+        
+        fun isHttps(url: String): Bool {
+            return url.startsWith("https://")
+        }
+    }
+}

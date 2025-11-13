@@ -1,0 +1,61 @@
+namespace Am.Web.Client {
+    class WebClient {
+        import Am.Lang
+        import Am.Net
+        import Am.Net.Ssl
+        import Am.IO
+        
+        fun constructor() {
+        }
+               
+        fun get(url: String): String {
+            return this.makeRequest("GET", url, "")
+        }
+        
+        fun post(url: String, data: String): String {
+            return this.makeRequest("POST", url, data)
+        }
+        
+        private fun makeRequest(method: String, url: String, data: String): String {
+            var parser = new UrlParser()
+            var host = parser.extractHost(url)
+            var path = parser.extractPath(url)
+            var port = parser.extractPort(url)
+            var isHttps = parser.isHttps(url)
+
+            ("Connecting to " + host + " port " + port.toString()).println()
+            
+            // Create socket connection
+            var s = Socket.create(AddressFamily.inet, SocketType.stream, ProtocolFamily.unspecified)
+            s.connect(host, port)
+            
+            "Connected".println()
+            
+            // Build HTTP request
+            var requestBuilder = new HttpRequestBuilder()
+            var request = requestBuilder.buildHttpRequest(method, path, host, data)
+            "Sending request".println()
+            
+            // Create appropriate stream (SSL or regular)
+            var ts: TextStream
+            if (isHttps) {
+                // Use SSL for HTTPS
+                var sslStream = new SslSocketStream(s, host)
+                var istream = sslStream as Stream
+                ts = new TextStream(istream)
+            } else {
+                // Use regular socket for HTTP
+                var socketStream = new SocketStream(s)
+                var istream = socketStream as Stream
+                ts = new TextStream(istream)
+            }
+            
+            ts.writeString(request)
+            
+            // Read response
+            var response = ts.readString()
+            s.close()          
+            return response
+        }
+    }
+}

@@ -1,0 +1,50 @@
+namespace WebClientDemo {
+    class Program {
+        import Am.Lang
+        import Am.IO
+        import Am.Web.Client
+
+        static fun main() {
+            "=== AmLang Web Client Demo ===".println()
+            "".println()
+            
+            // Create a web client instance
+            var client = new WebClient()
+            
+            // Demo 1: Simple GET request
+            "Demo 1_ Simple GET request".println()
+            "Making GET request to httpbin.org...".println()
+            var getResponse: String = client.get("http://httpbin.org/get")
+            "Response received_".println()
+            getResponse.println()
+            "".println()
+            
+            // Demo 2: POST request with data
+            "Demo 2_ POST request with data".println()
+            "Making POST request to httpbin.org...".println()
+            var postData = "name=AmLang&version=1.0"
+            var postResponse: String = client.post("http://httpbin.org/post", postData)
+            "POST Response received_".println()
+            postResponse.println()
+            "".println()
+            
+            // Demo 3: HTTPS request
+            "Demo 3_ HTTPS request".println()
+            "Making HTTPS request to httpbin.org...".println()
+            var httpsResponse: String = client.get("https://httpbin.org/get")
+            "HTTPS Response received_".println()
+            httpsResponse.println()
+            "".println()
+            
+            // Demo 4: Different host (HTTP)
+            "Demo 4_ Making request to different host".println()
+            "Making GET request to example.com...".println()
+            var exampleResponse: String = client.get("http://example.com/")
+            "Example.com response_".println()
+            exampleResponse.println()
+            "".println()
+            
+            "=== Demo Complete ===".println()
+        }
+    }
+}

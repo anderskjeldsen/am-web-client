@@ -1,0 +1,8 @@
+builds*/*
+*.generated.c
+*.o
+.DS_Store
+examples/**/builds/*
+examples/**/dependencies/*
+src/native-c/aros-x86-64/*
+src/native-c/linux-arm64v8/*
