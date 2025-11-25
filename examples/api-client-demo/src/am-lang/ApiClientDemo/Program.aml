@@ -1,0 +1,107 @@
+namespace ApiClientDemo {
+    class Program {
+        import Am.Lang
+        import Am.IO
+        import Am.Web.Client
+
+        static fun main() {
+            "=== AmLang API Client Demo ===".println()
+            "".println()
+            
+            // Create a web client instance
+            var client = new WebClient()
+            
+            // Demo 1: Test API connection
+            "Demo 1 - Testing API connection".println()
+            "Making GET request to ami-social-api...".println()
+            var testResponse: HttpResponse = client.get("http://localhost:9000/")
+            "API Connection test".println()
+            ("Status " + testResponse.getStatusCode().toString() + " " + testResponse.getStatusMessage()).println()
+            if (testResponse.isSuccess()) {
+                "✓ API server is running".println()
+            } else {
+                "✗ API server connection failed".println()
+            }
+            "".println()
+            
+            // Demo 2: Login attempt with correct credentials
+            "Demo 2 - Login with correct credentials".println()
+            "Attempting login...".println()
+            var loginSuccess = performLogin(client, "kjeldsenanders@gmail.com", "1234")
+            if (loginSuccess) {
+                "✓ Login successful with correct credentials".println()
+            } else {
+                "✗ Login failed with correct credentials".println()
+            }
+            "".println()
+            
+            // Demo 3: Login attempt with incorrect credentials
+            "Demo 3 - Login with incorrect credentials".println()
+            "Attempting login with wrong password...".println()
+            var loginFail = performLogin(client, "kjeldsenanders@gmail.com", "wrongpassword")
+            if (loginFail) {
+                "? Unexpected: Login succeeded with wrong credentials".println()
+            } else {
+                "✓ Login correctly rejected incorrect credentials".println()
+            }
+            "".println()
+            
+            // Demo 4: Login with invalid username
+            "Demo 4 - Login with invalid username".println()
+            "Attempting login with invalid username...".println()
+            var loginInvalid = performLogin(client, "invalid@example.com", "1234")
+            if (loginInvalid) {
+                "? Unexpected: Login succeeded with invalid username".println()
+            } else {
+                "✓ Login correctly rejected invalid username".println()
+            }
+            "".println()
+            
+            "=== API Client Demo Complete ===".println()
+        }
+        
+        static fun performLogin(client: WebClient, username: String, password: String): Bool {
+            // Prepare login data as form parameters
+            var loginData = "username=" + urlEncode(username) + "&password=" + urlEncode(password)
+            
+            // Make POST request to login endpoint
+            // Note: WebClient automatically sets appropriate headers for POST requests
+            var response: HttpResponse = client.post("http://localhost:9000/login", loginData)
+            
+            ("Login request sent for user: " + username).println()
+            ("Response Status: " + response.getStatusCode().toString() + " " + response.getStatusMessage()).println()
+            
+            // Check if login was successful (status 200)
+            if (response.getStatusCode() == 200) {
+                "Login response body:".println()
+                response.getBodyAsString().println()
+                
+                // Check if response contains expected JSON structure
+                var responseBody = response.getBodyAsString()
+                if (responseBody.length() > 0) {
+                    // Simple check if response contains token (basic string matching)
+                    if (responseBody.indexOf("token") >= 0 && responseBody.indexOf("username") >= 0) {
+                        "✓ Login successful - JSON response received".println()
+                        ("Response: " + responseBody).println()
+                        return true
+                    }
+                }
+                "✓ Login successful (status 200)".println()
+                return true
+            } else if (response.getStatusCode() == 401) {
+                "✗ Login failed - Unauthorized (401)".println()
+                return false
+            } else {
+                ("✗ Login failed - HTTP " + response.getStatusCode().toString()).println()
+                return false
+            }
+        }
+        
+        // Simple URL encoding - basic implementation
+        static fun urlEncode(str: String): String {
+            // For now, just return the string as-is
+            // In a production implementation, proper URL encoding would be needed
+            return str
+        }
+    }
+}

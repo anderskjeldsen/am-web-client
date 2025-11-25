@@ -8,12 +8,11 @@ clean:
 build:
 	$(CMD) build . -bt amigaos_docker -fld -maxOneError
 
-build-macos-arm:
-	$(CMD) build . -bt macos-arm -fld -maxOneError
-
-build-linux-x64:
+build-linux:
 	$(CMD) build . -bt linux-x64 -fld -maxOneError
 
+build-macos-arm:
+	$(CMD) build . -bt macos-arm -fld -maxOneError
 
 build-rl:
 	$(CMD) build . -bt amigaos_docker -rl
@@ -23,6 +22,3 @@ build-force-deps:
 
 test:
 	$(CMD) test . -bt amigaos_docker
-
-deps:
-	$(CMD) deps . -bt amigaos_docker
