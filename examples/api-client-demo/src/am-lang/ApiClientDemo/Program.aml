@@ -457,7 +457,8 @@ namespace ApiClientDemo {
                     if (success) {
                         var filename = responseObject.getString("filename")
                         var message = responseObject.getString("message")
-                        var uploadId = responseObject.getString("uploadId")  // Get the upload ID
+                        var uploadIdLong = responseObject.getLong("uploadId")  // Get the upload ID as Long
+                        var uploadId = uploadIdLong.toString()  // Convert to string
                         ("✓ Image uploaded successfully: " + filename).println()
                         ("✓ " + message).println()
                         ("✓ Upload ID: " + uploadId).println()
