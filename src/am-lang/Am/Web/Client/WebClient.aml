@@ -22,7 +22,20 @@ namespace Am.Web.Client {
             return this.makeRequest("DELETE", url, "")
         }
         
+        fun getWithHeaders(url: String, headers: HashMap<String, String>): HttpResponse {
+            return this.makeRequestWithHeaders("GET", url, "", headers)
+        }
+        
+        fun postWithHeaders(url: String, data: String, headers: HashMap<String, String>): HttpResponse {
+            return this.makeRequestWithHeaders("POST", url, data, headers)
+        }
+        
         private fun makeRequest(method: String, url: String, data: String): HttpResponse {
+            var emptyHeaders = new HashMap<String, String>()
+            return this.makeRequestWithHeaders(method, url, data, emptyHeaders)
+        }
+        
+        private fun makeRequestWithHeaders(method: String, url: String, data: String, headers: HashMap<String, String>): HttpResponse {
             var parser = new UrlParser()
             var host = parser.extractHost(url)
             var path = parser.extractPath(url)
@@ -37,9 +50,9 @@ namespace Am.Web.Client {
             
             "Connected".println()
             
-            // Build HTTP request
+            // Build HTTP request with headers
             var requestBuilder = new HttpRequestBuilder()
-            var request = requestBuilder.buildHttpRequest(method, path, host, data)
+            var request = requestBuilder.buildHttpRequestWithHeaders(method, path, host, data, headers)
             "Sending request".println()
             
             // Create appropriate stream (SSL or regular)
@@ -56,7 +69,20 @@ namespace Am.Web.Client {
                 ts = new TextStream(istream)
             }
             
-            ts.writeString(request)
+            // Debug: Print the actual request being sent
+            ("=== HTTP REQUEST DEBUG ===").println()
+            ("Request length: " + request.length().toString()).println()
+            ("Full request (first 200 chars):").println()
+            if (request.length() > 200) {
+                request.substring(0UI, 200UI).println()
+                ("... (truncated for display, but full request will be sent)").println()
+            } else {
+                request.println()
+            }
+            ("=== END REQUEST DEBUG ===").println()
+            
+            // Write request directly as bytes to avoid TextStream buffer limitations
+            this.writeStringAsBytes(s, request)
             
             // Read response
             var rawResponse = ts.readString()
@@ -162,6 +188,13 @@ namespace Am.Web.Client {
             }
             
             return new HttpResponse(statusCode, statusMessage, headers, body)
+        }
+        
+        private fun writeStringAsBytes(socket: Socket, data: String) {
+            // Convert string to bytes and write directly to socket to bypass TextStream limitations
+            var bytes = data.toBytes("UTF-8")
+            var socketStream = new SocketStream(socket)
+            socketStream.write(bytes, 0L, bytes.length())
         }
     }
 }

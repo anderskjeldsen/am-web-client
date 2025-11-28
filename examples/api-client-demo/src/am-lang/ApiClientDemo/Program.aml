@@ -1,11 +1,16 @@
 namespace ApiClientDemo {
     class Program {
         import Am.Lang
+        import Am.Collections
         import Am.IO
         import Am.Web.Client
+        import Am.Json
+        import Am.Util.Parsers.Text
+        import Am.Util
 
-        static fun main() {
+        static fun main(args: String[]) {
             "=== AmLang API Client Demo ===".println()
+            "This demo tests JSON-based authentication with ami-social-api".println()
             "".println()
             
             // Create a web client instance
@@ -24,12 +29,22 @@ namespace ApiClientDemo {
             }
             "".println()
             
-            // Demo 2: Login attempt with correct credentials
+            // Demo 2: Login attempt with correct credentials and get profile
             "Demo 2 - Login with correct credentials".println()
             "Attempting login...".println()
-            var loginSuccess = performLogin(client, "kjeldsenanders@gmail.com", "1234")
-            if (loginSuccess) {
+            var token = performLoginAndGetToken(client, "kjeldsenanders@gmail.com", "1234")
+            if (token != null && token.length() > 0) {
                 "✓ Login successful with correct credentials".println()
+                
+                // Demo 2b: Call me endpoint with JWT token
+                "".println()
+                "Demo 2b - Calling me endpoint with JWT token".println()
+                var profileSuccess = callMeEndpoint(client, token)
+                if (profileSuccess) {
+                    "✓ Profile retrieved successfully".println()
+                } else {
+                    "✗ Failed to retrieve profile".println()
+                }
             } else {
                 "✗ Login failed with correct credentials".println()
             }
@@ -57,16 +72,90 @@ namespace ApiClientDemo {
             }
             "".println()
             
+            // Demo 5: Test me endpoint without token (should fail)
+            "Demo 5 - Calling me endpoint without token".println()
+            var unauthorizedCall = callMeEndpoint(client, "")
+            if (unauthorizedCall) {
+                "? Unexpected: Profile call succeeded without token".println()
+            } else {
+                "✓ Profile call correctly rejected without authentication".println()
+            }
+            "".println()
+            
+            // Demo 6: Test me endpoint with invalid token (should fail)
+            "Demo 6 - Calling me endpoint with invalid token".println()
+            var invalidTokenCall = callMeEndpoint(client, "invalid.jwt.token")
+            if (invalidTokenCall) {
+                "? Unexpected: Profile call succeeded with invalid token".println()
+            } else {
+                "✓ Profile call correctly rejected invalid token".println()
+            }
+            "".println()
+            
+            // Demo 7: Re-test me endpoint with valid token (should succeed)
+            if (token != null && token.length() > 0) {
+                "Demo 7 - Re-testing me endpoint with valid token".println()
+                var validTokenCall = callMeEndpoint(client, token)
+                if (validTokenCall) {
+                    "✓ Profile call succeeded with valid token (reconfirmed)".println()
+                } else {
+                    "✗ Profile call failed with valid token (unexpected)".println()
+                }
+            } else {
+                "Demo 7 - Skipped (no valid token available)".println()
+            }
+            "".println()
+            
+            // Demo 8: Test image upload with valid token
+            if (token != null && token.length() > 0) {
+                "Demo 8 - Testing image upload with valid token".println()
+                
+                // Use command line argument for image path, fallback to default
+                var imagePath = "builds/bin/linux-x64/c64image.png"  // default
+                if (args.length() > 0UI) {
+                    imagePath = args[0]
+                    ("Using image from command line: " + imagePath).println()
+                } else {
+                    ("Using default image: " + imagePath).println()
+                }
+                
+                var uploadId = uploadImageAndGetId(client, token, imagePath)
+                if (uploadId.length() > 0) {
+                    "✓ Image upload succeeded with valid token".println()
+                    
+                    // Demo 8b: Test retrieving the uploaded image
+                    "".println()
+                    "Demo 8b - Testing image retrieval by upload ID".println()
+                    var retrievalSuccess = retrieveUploadedImage(client, token, uploadId)
+                    if (retrievalSuccess) {
+                        "✓ Image retrieval succeeded".println()
+                    } else {
+                        "✗ Image retrieval failed".println()
+                    }
+                } else {
+                    "✗ Image upload failed - check server logs for details".println()
+                }
+            } else {
+                "Demo 8 - Skipped (no valid token available)".println()
+            }
+            "".println()
+            
             "=== API Client Demo Complete ===".println()
         }
         
         static fun performLogin(client: WebClient, username: String, password: String): Bool {
-            // Prepare login data as form parameters
-            var loginData = "username=" + urlEncode(username) + "&password=" + urlEncode(password)
+            // Prepare login data as JSON using JsonObject
+            var loginRequest = new JsonObject()
+            loginRequest.putString("username", username)
+            loginRequest.putString("password", password)
+            var loginJson = loginRequest.toJsonString()
             
-            // Make POST request to login endpoint
-            // Note: WebClient automatically sets appropriate headers for POST requests
-            var response: HttpResponse = client.post("http://localhost:9000/login", loginData)
+            // Debug: Show the JSON we're sending
+            ("Sending JSON: " + loginJson).println()
+            
+            // Make POST request to login endpoint with JSON body
+            // Note: WebClient will automatically set Content-Type for JSON requests
+            var response: HttpResponse = client.post("http://localhost:9000/login", loginJson)
             
             ("Login request sent for user: " + username).println()
             ("Response Status: " + response.getStatusCode().toString() + " " + response.getStatusMessage()).println()
@@ -79,7 +168,7 @@ namespace ApiClientDemo {
                 // Check if response contains expected JSON structure
                 var responseBody = response.getBodyAsString()
                 if (responseBody.length() > 0) {
-                    // Simple check if response contains token (basic string matching)
+                    // Simple check if response looks like JSON
                     if (responseBody.indexOf("token") >= 0 && responseBody.indexOf("username") >= 0) {
                         "✓ Login successful - JSON response received".println()
                         ("Response: " + responseBody).println()
@@ -97,11 +186,353 @@ namespace ApiClientDemo {
             }
         }
         
-        // Simple URL encoding - basic implementation
-        static fun urlEncode(str: String): String {
-            // For now, just return the string as-is
-            // In a production implementation, proper URL encoding would be needed
-            return str
+        static fun performLoginAndGetToken(client: WebClient, username: String, password: String): String {
+            // Prepare login data as JSON using JsonObject
+            var loginRequest = new JsonObject()
+            loginRequest.putString("username", username)
+            loginRequest.putString("password", password)
+            var loginJson = loginRequest.toJsonString()
+            
+            // Debug: Show the JSON we're sending
+            ("Sending JSON: " + loginJson).println()
+            
+            // Make POST request to login endpoint with JSON body
+            var response: HttpResponse = client.post("http://localhost:9000/login", loginJson)
+            
+            ("Login request sent for user: " + username).println()
+            ("Response Status: " + response.getStatusCode().toString() + " " + response.getStatusMessage()).println()
+            
+            // Check if login was successful (status 200)
+            if (response.getStatusCode() == 200) {
+                "Login response body:".println()
+                var responseBody = response.getBodyAsString()
+                responseBody.println()
+                
+                // Extract JWT token from response
+                var token = extractTokenFromResponse(responseBody)
+                if (token != null && token.length() > 0) {
+                    "✓ Login successful - JWT token received".println()
+                    return token
+                } else {
+                    "✗ Login response missing token".println()
+                    return ""
+                }
+            } else {
+                ("✗ Login failed - HTTP " + response.getStatusCode().toString()).println()
+                return ""
+            }
         }
+        
+        static fun callMeEndpoint(client: WebClient, token: String): Bool {
+            "Calling /me endpoint...".println()
+            
+            var response: HttpResponse
+            
+            // Add Bearer token authorization header
+            if (token.length() > 0) {
+                var authHeader = "Bearer " + token
+                ("Using Authorization header: " + authHeader.substring(0UI, 20UI) + "...").println()
+                
+                // Create headers map with Authorization header
+                var headers = new HashMap<String, String>()
+                headers.set("Authorization", authHeader)
+                
+                // Make GET request with headers
+                response = client.getWithHeaders("http://localhost:9000/me", headers)
+            } else {
+                "No token provided - calling without authentication".println()
+                // Make regular GET request without headers
+                response = client.get("http://localhost:9000/me")
+            }
+            
+            ("Response Status: " + response.getStatusCode().toString() + " " + response.getStatusMessage()).println()
+            
+            if (response.getStatusCode() == 200) {
+                "Profile response:".println()
+                response.getBodyAsString().println()
+                "✓ Profile data retrieved successfully".println()
+                return true
+            } else if (response.getStatusCode() == 401) {
+                "✗ Unauthorized - Invalid or missing token".println()
+                return false
+            } else {
+                ("✗ Profile request failed - HTTP " + response.getStatusCode().toString()).println()
+                return false
+            }
+        }
+        
+        static fun extractTokenFromResponse(responseBody: String): String {
+            // Parse JSON response using JsonParser
+            var textParser = new TextParser(responseBody)
+            var jsonParser = new JsonParser(textParser)
+            var jsonRoot = jsonParser.parse()
+            var responseObject = jsonRoot.asObject()
+            
+            // Extract the token field
+            return responseObject.getString("token")
+        }
+        
+        static fun uploadImage(client: WebClient, accessToken: String, imagePath: String): Bool {
+            "=== Image Upload Test ===".println()
+            ("Uploading image: " + imagePath).println()
+            ("Access Token: " + accessToken).println()
+            
+            try {
+                // Read file data using FileStream
+                var file = new File(imagePath)
+                if (!file.exists()) {
+                    ("✗ File does not exist: " + imagePath).println()
+                    return false
+                }
+                
+                ("Reading file: " + imagePath).println()
+                var fileStream = new FileStream(file, FileAccess.readOnly)
+                
+                // Read file in chunks to get the entire file
+                var allBytes = new List<Byte>()
+                var buffer = new Byte[8192]  // 8KB chunks
+                var totalBytesRead = 0UI
+                
+                var bytesRead = fileStream.read(buffer, 0L, 8192UI)
+                while (bytesRead > 0UI) {
+                    // Add the bytes we read to our list
+                    var i = 0
+                    while (i < bytesRead.toInt()) {
+                        allBytes.add(buffer[i])
+                        i += 1
+                    }
+                    totalBytesRead += bytesRead
+                    
+                    // Read the next chunk
+                    bytesRead = fileStream.read(buffer, 0L, 8192UI)
+                }
+                
+                ("Read " + totalBytesRead.toString() + " bytes from file").println()
+                
+                // Convert List<Byte> to Byte[] array
+                var listSize = allBytes.getSize()
+                var imageBytes = new Byte[listSize]
+                var j = 0
+                while (j < listSize) {
+                    imageBytes[j] = allBytes.get(j)
+                    j += 1
+                }
+                
+                var finalBytesRead = totalBytesRead
+                
+                // Send base64-encoded binary data directly (no JSON wrapper)
+                ("Binary data size: " + finalBytesRead.toString() + " bytes").println()
+                var base64Data = Base64.encode(imageBytes, finalBytesRead)
+                ("Base64 data length: " + base64Data.length().toString()).println()
+                
+                // Create headers with Authorization
+                var headers = new HashMap<String, String>()
+                headers.set("Authorization", "Bearer " + accessToken)
+                headers.set("Content-Type", "text/plain")
+                
+                ("Making POST request to upload endpoint...").println()
+                
+                // Make POST request with base64 data as plain text body
+                var response: HttpResponse = client.postWithHeaders("http://localhost:9000/upload-image", base64Data, headers)
+                
+                ("Upload request sent").println()
+                ("Response Status: " + response.getStatusCode().toString() + " " + response.getStatusMessage()).println()
+                
+                if (response.getStatusCode() == 200) {
+                    "Upload response:".println()
+                    var responseBody = response.getBodyAsString()
+                    responseBody.println()
+                    
+                    // Parse JSON response to check success
+                    var textParser = new TextParser(responseBody)
+                    var jsonParser = new JsonParser(textParser)
+                    var jsonRoot = jsonParser.parse()
+                    var responseObject = jsonRoot.asObject()
+                    
+                    var success = responseObject.getBool("success")
+                    if (success) {
+                        var filename = responseObject.getString("filename")
+                        var message = responseObject.getString("message")
+                        ("✓ Image uploaded successfully: " + filename).println()
+                        ("✓ " + message).println()
+                        return true
+                    } else {
+                        "✗ Upload failed - Server reported failure".println()
+                        return false
+                    }
+                } else if (response.getStatusCode() == 401) {
+                    "✗ Upload failed - Unauthorized (invalid token)".println()
+                    return false
+                } else if (response.getStatusCode() == 400) {
+                    "✗ Upload failed - Bad Request (invalid image data)".println()
+                    return false
+                } else {
+                    ("✗ Upload failed - HTTP " + response.getStatusCode().toString()).println()
+                    return false
+                }
+            } catch (e: Exception) {
+                ("✗ Upload failed - Error: " + e.toString()).println()
+                return false
+            }
+        }
+        
+        static fun uploadImageAndGetId(client: WebClient, accessToken: String, imagePath: String): String {
+            "=== Image Upload Test ===".println()
+            ("Uploading image: " + imagePath).println()
+            ("Access Token: " + accessToken).println()
+            
+            try {
+                // Read file data using FileStream
+                var file = new File(imagePath)
+                if (!file.exists()) {
+                    ("✗ File does not exist: " + imagePath).println()
+                    return ""
+                }
+                
+                ("Reading file: " + imagePath).println()
+                var fileStream = new FileStream(file, FileAccess.readOnly)
+                
+                // Read file in chunks to get the entire file
+                var allBytes = new List<Byte>()
+                var buffer = new Byte[8192]  // 8KB chunks
+                var totalBytesRead = 0UI
+                
+                var bytesRead = fileStream.read(buffer, 0L, 8192UI)
+                while (bytesRead > 0UI) {
+                    // Add the bytes we read to our list
+                    var i = 0
+                    while (i < bytesRead.toInt()) {
+                        allBytes.add(buffer[i])
+                        i += 1
+                    }
+                    totalBytesRead += bytesRead
+                    
+                    // Read the next chunk
+                    bytesRead = fileStream.read(buffer, 0L, 8192UI)
+                }
+                
+                ("Read " + totalBytesRead.toString() + " bytes from file").println()
+                
+                // Convert List<Byte> to Byte[] array
+                var listSize = allBytes.getSize()
+                var imageBytes = new Byte[listSize]
+                var j = 0
+                while (j < listSize) {
+                    imageBytes[j] = allBytes.get(j)
+                    j += 1
+                }
+                
+                var finalBytesRead = totalBytesRead
+                
+                // Send base64-encoded binary data directly (no JSON wrapper)
+                ("Binary data size: " + finalBytesRead.toString() + " bytes").println()
+                var base64Data = Base64.encode(imageBytes, finalBytesRead)
+                ("Base64 data length: " + base64Data.length().toString()).println()
+                
+                // Create headers with Authorization
+                var headers = new HashMap<String, String>()
+                headers.set("Authorization", "Bearer " + accessToken)
+                headers.set("Content-Type", "text/plain")
+                
+                ("Making POST request to upload endpoint...").println()
+                
+                // Make POST request with base64 data as plain text body
+                var response: HttpResponse = client.postWithHeaders("http://localhost:9000/upload-image", base64Data, headers)
+                
+                ("Upload request sent").println()
+                ("Response Status: " + response.getStatusCode().toString() + " " + response.getStatusMessage()).println()
+                
+                if (response.getStatusCode() == 200) {
+                    "Upload response:".println()
+                    var responseBody = response.getBodyAsString()
+                    responseBody.println()
+                    
+                    // Parse JSON response to check success and get upload ID
+                    var textParser = new TextParser(responseBody)
+                    var jsonParser = new JsonParser(textParser)
+                    var jsonRoot = jsonParser.parse()
+                    var responseObject = jsonRoot.asObject()
+                    
+                    var success = responseObject.getBool("success")
+                    if (success) {
+                        var filename = responseObject.getString("filename")
+                        var message = responseObject.getString("message")
+                        var uploadId = responseObject.getString("uploadId")  // Get the upload ID
+                        ("✓ Image uploaded successfully: " + filename).println()
+                        ("✓ " + message).println()
+                        ("✓ Upload ID: " + uploadId).println()
+                        return uploadId
+                    } else {
+                        "✗ Upload failed - Server reported failure".println()
+                        return ""
+                    }
+                } else if (response.getStatusCode() == 401) {
+                    "✗ Upload failed - Unauthorized (invalid token)".println()
+                    return ""
+                } else if (response.getStatusCode() == 400) {
+                    "✗ Upload failed - Bad Request (invalid image data)".println()
+                    return ""
+                } else {
+                    ("✗ Upload failed - HTTP " + response.getStatusCode().toString()).println()
+                    return ""
+                }
+            } catch (e: Exception) {
+                ("✗ Upload failed - Error: " + e.toString()).println()
+                return ""
+            }
+        }
+        
+        static fun retrieveUploadedImage(client: WebClient, accessToken: String, uploadId: String): Bool {
+            ("=== Image Retrieval Test ===").println()
+            ("Retrieving upload ID: " + uploadId).println()
+            ("Access Token: " + accessToken).println()
+            
+            try {
+                // Create headers with Authorization
+                var headers = new HashMap<String, String>()
+                headers.set("Authorization", "Bearer " + accessToken)
+                
+                ("Making GET request to retrieve upload...").println()
+                
+                // Make GET request to retrieve the uploaded image
+                var response: HttpResponse = client.getWithHeaders("http://localhost:9000/uploads/" + uploadId, headers)
+                
+                ("Retrieval request sent").println()
+                ("Response Status: " + response.getStatusCode().toString() + " " + response.getStatusMessage()).println()
+                
+                if (response.getStatusCode() == 200) {
+                    var contentType = response.getHeader("Content-Type")
+                    if (contentType != null) {
+                        ("✓ Content-Type: " + contentType).println()
+                    }
+                    
+                    var contentLength = response.getHeader("Content-Length")
+                    if (contentLength != null) {
+                        ("✓ Content-Length: " + contentLength + " bytes").println()
+                    } else {
+                        // If no Content-Length header, get body size
+                        var body = response.getBodyAsString()
+                        ("✓ Response body size: " + body.length().toString() + " characters").println()
+                    }
+                    
+                    "✓ Image retrieved successfully".println()
+                    return true
+                } else if (response.getStatusCode() == 401) {
+                    "✗ Retrieval failed - Unauthorized (invalid token)".println()
+                    return false
+                } else if (response.getStatusCode() == 404) {
+                    "✗ Retrieval failed - Upload not found or access denied".println()
+                    return false
+                } else {
+                    ("✗ Retrieval failed - HTTP " + response.getStatusCode().toString()).println()
+                    return false
+                }
+            } catch (e: Exception) {
+                ("✗ Retrieval failed - Error: " + e.toString()).println()
+                return false
+            }
+        }
+
+
     }
 }

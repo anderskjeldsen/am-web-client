@@ -3,17 +3,23 @@ version: 1.0.0
 type: application
 dependencies:
   - id: am-lang-core
-    realm: github
-    type: git-repo
-    tag: latest
-    branch: master
-    url: https://github.com/anderskjeldsen/am-lang-core.git
+    type: local
+    path: ../../../am-lang-core
+#    realm: github
+#    type: git-repo
+#    tag: latest
+#    branch: master
+    features: ["floatingPoint"]
+#    url: https://github.com/anderskjeldsen/am-lang-core.git
   - id: am-web-client
     type: local
     path: ../../
   - id: am-ssl
     type: local
     path: ../../../am-ssl
+  - id: am-json
+    type: local
+    path: ../../../am-json
 platforms:
   - id: libc
     abstract: true

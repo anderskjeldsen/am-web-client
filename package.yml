@@ -8,6 +8,7 @@ dependencies:
     tag: latest
     branch: master
     url: https://github.com/anderskjeldsen/am-lang-core.git
+    features: ["floatingPoint"]
   - id: am-net
     type: local
     path: ../am-net
@@ -26,7 +27,7 @@ platforms:
     additionalCSources: 
     additionalIncludePaths:
     gccAdditionalOptions:
-      - -noixemul     
+      - -noixemul
     gccAdditionalLibraries:
       - socket
   - id: macos
