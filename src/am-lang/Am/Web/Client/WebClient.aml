@@ -1,200 +1,336 @@
 namespace Am.Web.Client {
+    // HTTP/1.1 client. The on-wire body is bytes (an HTTP body is just
+    // an opaque octet stream), so the core entry point is `requestBytes`
+    // and the String-based methods are convenience wrappers that encode
+    // / decode UTF-8 around it.
+    //
+    // Reach for `getBytes` / `postBytes` etc. when the response isn't
+    // text — image downloads, git packfiles, binary archives. The
+    // String wrappers will mangle non-UTF-8 payloads on the way back.
+    //
+    // Not a general-purpose client: every request uses Connection:
+    // close (no keepalive), there's no automatic redirect following,
+    // and the response body is buffered fully in memory.
     class WebClient {
         import Am.Lang
         import Am.Net
         import Am.Net.Ssl
         import Am.IO
         import Am.Collections
-                       
+
+        static var userAgent: String = "AmLang-WebClient/1.0"
+
+        // ---- String-based API (existing) --------------------------------
+
         fun get(url: String): HttpResponse {
-            return this.makeRequest("GET", url, "")
+            return this.requestString("GET", url, "", new HashMap<String, String>())
         }
-        
+
         fun post(url: String, data: String): HttpResponse {
-            return this.makeRequest("POST", url, data)
+            return this.requestString("POST", url, data, new HashMap<String, String>())
         }
-        
+
         fun put(url: String, data: String): HttpResponse {
-            return this.makeRequest("PUT", url, data)
+            return this.requestString("PUT", url, data, new HashMap<String, String>())
         }
-        
+
         fun delete(url: String): HttpResponse {
-            return this.makeRequest("DELETE", url, "")
+            return this.requestString("DELETE", url, "", new HashMap<String, String>())
         }
-        
+
         fun getWithHeaders(url: String, headers: HashMap<String, String>): HttpResponse {
-            return this.makeRequestWithHeaders("GET", url, "", headers)
+            return this.requestString("GET", url, "", headers)
         }
-        
+
         fun postWithHeaders(url: String, data: String, headers: HashMap<String, String>): HttpResponse {
-            return this.makeRequestWithHeaders("POST", url, data, headers)
+            return this.requestString("POST", url, data, headers)
         }
-        
-        private fun makeRequest(method: String, url: String, data: String): HttpResponse {
-            var emptyHeaders = new HashMap<String, String>()
-            return this.makeRequestWithHeaders(method, url, data, emptyHeaders)
+
+        fun putWithHeaders(url: String, data: String, headers: HashMap<String, String>): HttpResponse {
+            return this.requestString("PUT", url, data, headers)
         }
-        
-        private fun makeRequestWithHeaders(method: String, url: String, data: String, headers: HashMap<String, String>): HttpResponse {
+
+        fun deleteWithHeaders(url: String, headers: HashMap<String, String>): HttpResponse {
+            return this.requestString("DELETE", url, "", headers)
+        }
+
+        // ---- Binary API -------------------------------------------------
+
+        fun getBytes(url: String): HttpResponse {
+            return this.requestBytes("GET", url, new UByte[0UI], new HashMap<String, String>())
+        }
+
+        fun postBytes(url: String, data: UByte[]): HttpResponse {
+            return this.requestBytes("POST", url, data, new HashMap<String, String>())
+        }
+
+        fun putBytes(url: String, data: UByte[]): HttpResponse {
+            return this.requestBytes("PUT", url, data, new HashMap<String, String>())
+        }
+
+        fun deleteBytes(url: String): HttpResponse {
+            return this.requestBytes("DELETE", url, new UByte[0UI], new HashMap<String, String>())
+        }
+
+        fun getBytesWithHeaders(url: String, headers: HashMap<String, String>): HttpResponse {
+            return this.requestBytes("GET", url, new UByte[0UI], headers)
+        }
+
+        fun postBytesWithHeaders(url: String, data: UByte[], headers: HashMap<String, String>): HttpResponse {
+            return this.requestBytes("POST", url, data, headers)
+        }
+
+        fun putBytesWithHeaders(url: String, data: UByte[], headers: HashMap<String, String>): HttpResponse {
+            return this.requestBytes("PUT", url, data, headers)
+        }
+
+        // ---- Core request paths ----------------------------------------
+
+        private fun requestString(method: String, url: String, data: String,
+                                   headers: HashMap<String, String>): HttpResponse {
+            var bodyBytes = new UByte[0UI]
+            if (data != null && data.length() > 0) {
+                bodyBytes = data.toBytes("UTF-8")
+            }
+            // Mirror the legacy Content-Type sniffing so existing callers
+            // that pass JSON or form payloads without an explicit type
+            // still get the right header set for them.
+            var merged = WebClient.mergeContentType(headers, data)
+            return this.requestBytes(method, url, bodyBytes, merged)
+        }
+
+        // The byte-level core. Headers are sent verbatim plus the standard
+        // Host / User-Agent / Connection / Content-Length tail. Caller
+        // owns the Content-Type — if the body is non-empty and there's
+        // no Content-Type header, nothing is added.
+        fun requestBytes(method: String, url: String, body: UByte[],
+                         headers: HashMap<String, String>): HttpResponse {
             var parser = new UrlParser()
             var host = parser.extractHost(url)
             var path = parser.extractPath(url)
             var port = parser.extractPort(url)
             var isHttps = parser.isHttps(url)
 
-            ("Connecting to " + host + " port " + port.toString()).println()
-            
-            // Create socket connection
-            var s = Socket.create(AddressFamily.inet, SocketType.stream, ProtocolFamily.unspecified)
-            s.connect(host, port)
-            
-            "Connected".println()
-            
-            // Build HTTP request with headers
-            var requestBuilder = new HttpRequestBuilder()
-            var request = requestBuilder.buildHttpRequestWithHeaders(method, path, host, data, headers)
-            "Sending request".println()
-            
-            // Create appropriate stream (SSL or regular)
-            var ts: TextStream
+            var socket = Socket.create(AddressFamily.inet, SocketType.stream, ProtocolFamily.unspecified)
+            socket.connect(host, port)
+
+            // The compiler currently can't take a Stream-typed local
+            // assigned from either branch of an if, so we just inline
+            // the per-scheme tail — functionally identical otherwise.
             if (isHttps) {
-                // Use SSL for HTTPS
-                var sslStream = new SslSocketStream(s, host)
-                var istream = sslStream as Stream
-                ts = new TextStream(istream)
+                var sslStream = new SslSocketStream(socket, host)
+                WebClient.sendRequest(sslStream, method, host, port, isHttps, path, body, headers)
+                var reader = new StreamReader(sslStream)
+                var response = WebClient.readResponse(reader)
+                socket.close()
+                return response
             } else {
-                // Use regular socket for HTTP
-                var socketStream = new SocketStream(s)
-                var istream = socketStream as Stream
-                ts = new TextStream(istream)
+                var plainStream = new SocketStream(socket)
+                WebClient.sendRequest(plainStream, method, host, port, isHttps, path, body, headers)
+                var reader = new StreamReader(plainStream)
+                var response = WebClient.readResponse(reader)
+                socket.close()
+                return response
             }
-            
-            // Debug: Print the actual request being sent
-            ("=== HTTP REQUEST DEBUG ===").println()
-            ("Request length: " + request.length().toString()).println()
-            ("Full request (first 200 chars):").println()
-            if (request.length() > 200) {
-                request.substring(0UI, 200UI).println()
-                ("... (truncated for display, but full request will be sent)").println()
-            } else {
-                request.println()
-            }
-            ("=== END REQUEST DEBUG ===").println()
-            
-            // Write request directly as bytes to avoid TextStream buffer limitations
-            this.writeStringAsBytes(s, request)
-            
-            // Read response
-            var rawResponse = ts.readString()
-            s.close()
-            
-            // Parse HTTP response
-            return this.parseHttpResponse(rawResponse)
         }
-        
-        private fun parseHttpResponse(rawResponse: String): HttpResponse {
-            if (rawResponse.length() == 0) {
+
+        // ---- Request writing -------------------------------------------
+
+        private static fun sendRequest(stream: Stream,
+                                        method: String,
+                                        host: String,
+                                        port: Int,
+                                        isHttps: Bool,
+                                        path: String,
+                                        body: UByte[],
+                                        headers: HashMap<String, String>) {
+            var sb = new StringBuilder()
+            sb.add(method).add(" ").add(path).add(" HTTP/1.1\r\n")
+            sb.add("Host: ").add(host)
+            if ((isHttps && port != 443) || (!isHttps && port != 80)) {
+                sb.add(":").add(port.toString())
+            }
+            sb.add("\r\n")
+            sb.add("User-Agent: ").add(WebClient.userAgent).add("\r\n")
+            sb.add("Connection: close\r\n")
+            sb.add("Accept-Encoding: identity\r\n")
+
+            // `keys()` on a HashMap-typed local trips the compiler
+            // ("Can't inject as operator on expression"); `buildKeys()`
+            // is the same lookup without the wrapper indirection.
+            var headerKeys = headers.buildKeys()
+            var hi = 0
+            while (hi < headerKeys.getSize()) {
+                var k = headerKeys.get(hi)
+                var v = headers.get(k)
+                sb.add(k).add(": ").add(v).add("\r\n")
+                hi++
+            }
+
+            if (body.length() > 0UI) {
+                sb.add("Content-Length: ").add(body.length().toString()).add("\r\n")
+            }
+            sb.add("\r\n")
+
+            var headBytes = sb.toString().toBytes("UTF-8")
+            stream.write(headBytes, 0L, headBytes.length())
+            if (body.length() > 0UI) {
+                stream.write(body, 0L, body.length())
+            }
+        }
+
+        // ---- Response reading ------------------------------------------
+
+        private static fun readResponse(reader: StreamReader): HttpResponse {
+            var statusLine = reader.readLine()
+            if (statusLine == null) {
                 var emptyHeaders = new HashMap<String, String>()
-                return new HttpResponse(0, "No Response", emptyHeaders, "")
+                return new HttpResponse(0, "No Response", emptyHeaders, new UByte[0UI])
             }
-            
-            // Find the end of the status line
-            var firstLineEnd = rawResponse.indexOf("\n")
-            if (firstLineEnd < 0) {
-                var emptyHeaders = new HashMap<String, String>()
-                return new HttpResponse(0, "Invalid Response", emptyHeaders, rawResponse)
+            var statusParts = statusLine.splitByString(" ")
+            var statusCode = 0
+            var statusMessage = ""
+            if (statusParts.length() >= 2UI) {
+                statusCode = Int.parse(statusParts[1UI])
             }
-            
-            // Parse status line (HTTP/1.1 200 OK)
-            var statusLine = rawResponse.substring(0UI, firstLineEnd.toUInt())
-            if (statusLine.endsWith("\r")) {
-                statusLine = statusLine.substring(0UI, (statusLine.length() - 1).toUInt())
-            }
-            
-            var statusParts: Array<String> = statusLine.splitByString(" ")
-            var statusCode = 200
-            var statusMessage = "OK"
-            
-            if (statusParts.length() >= 2) {
-                var statusCodeStr: String = statusParts[1]
-                statusCode = Int.parse(statusCodeStr)
-            }
-            if (statusParts.length() >= 3) {
-                statusMessage = statusParts[2]
-                // Join remaining parts for multi-word status messages
-                var i = 3
+            if (statusParts.length() >= 3UI) {
+                var i = 2UI
+                var sbStatus = new StringBuilder()
                 while (i < statusParts.length()) {
-                    var nextPart: String = statusParts[i]
-                    statusMessage = statusMessage + " " + nextPart
-                    i = i + 1
+                    if (i > 2UI) {
+                        sbStatus.add(" ")
+                    }
+                    sbStatus.add(statusParts[i])
+                    i++
                 }
+                statusMessage = sbStatus.toString()
             }
-            
-            // Find the end of headers (double CRLF)
-            var headersEnd = rawResponse.indexOf("\r\n\r\n")
-            if (headersEnd < 0) {
-                headersEnd = rawResponse.indexOf("\n\n")
-                if (headersEnd < 0) {
-                    var emptyHeaders = new HashMap<String, String>()
-                    return new HttpResponse(statusCode, statusMessage, emptyHeaders, "")
-                }
-                headersEnd = headersEnd + 2
-            } else {
-                headersEnd = headersEnd + 4
-            }
-            
-            // Parse headers
+
+            // Headers stored lowercase; HttpResponse.getHeader() handles
+            // a case-insensitive lookup so legacy callers passing
+            // "Content-Type" still work.
             var headers = new HashMap<String, String>()
-            var headerStart = firstLineEnd + 1
-            var headerLength = headersEnd - headerStart - 2
-            if (headerLength < 0 || headerStart >= rawResponse.length()) {
-                headerLength = 0
-            }
-            if (headerStart + headerLength > rawResponse.length()) {
-                headerLength = rawResponse.length() - headerStart
-            }
-            var headerSection = ""
-            if (headerLength > 0) {
-                headerSection = rawResponse.substring(headerStart.toUInt(), headerLength.toUInt())
-            }
-            var headerLines: Array<String> = headerSection.splitByString("\n")
-            
-            var h = 0
-            while (h < headerLines.length()) {
-                var headerLine: String = headerLines[h]
-                
-                // Skip empty lines (end of headers)
-                if (headerLine.length() == 0 || (headerLine.length() == 1 && headerLine.endsWith("\r"))) {
+            loop {
+                var line = reader.readLine()
+                if (line == null || line.length() == 0) {
                     break
                 }
-                
-                if (headerLine.endsWith("\r")) {
-                    headerLine = headerLine.substring(0UI, (headerLine.length() - 1).toUInt())
+                var colon = line.indexOf(":")
+                if (colon > 0) {
+                    var name = line.substring(0UI, colon.toUInt()).toLowerCase()
+                    var value = line.substringToEnd((colon + 1).toUInt()).trim()
+                    headers.set(name, value)
                 }
-                
-                var colonIndex: Int = headerLine.indexOf(":")
-                if (colonIndex > 0) {
-                    var headerName: String = headerLine.substring(0UI, colonIndex.toUInt()).trim()
-                    var headerValue: String = headerLine.substring((colonIndex + 1).toUInt(), (headerLine.length() - (colonIndex + 1)).toUInt()).trim()
-                    headers.set(headerName, headerValue)
-                }
-                h = h + 1
             }
-            
-            // Extract body
-            var body = ""
-            if (headersEnd < rawResponse.length()) {
-                body = rawResponse.substring(headersEnd.toUInt(), (rawResponse.length() - headersEnd).toUInt())
-            }
-            
+
+            var body = WebClient.readBody(reader, headers)
             return new HttpResponse(statusCode, statusMessage, headers, body)
         }
-        
-        private fun writeStringAsBytes(socket: Socket, data: String) {
-            // Convert string to bytes and write directly to socket to bypass TextStream limitations
-            var bytes = data.toBytes("UTF-8")
-            var socketStream = new SocketStream(socket)
-            socketStream.write(bytes, 0L, bytes.length())
+
+        private static fun readBody(reader: StreamReader, headers: HashMap<String, String>): UByte[] {
+            if (headers.containsKey("transfer-encoding")) {
+                var te = headers.get("transfer-encoding").toLowerCase()
+                if (te.indexOf("chunked") >= 0) {
+                    return WebClient.readChunkedBody(reader)
+                }
+            }
+            if (headers.containsKey("content-length")) {
+                var lenStr = headers.get("content-length").trim()
+                var n = Int.parse(lenStr)
+                if (n <= 0) {
+                    return new UByte[0UI]
+                }
+                return reader.readExact(n)
+            }
+            // No length advertised — drain to EOF, relying on the
+            // `Connection: close` we always send.
+            return reader.readToEnd()
+        }
+
+        private static fun readChunkedBody(reader: StreamReader): UByte[] {
+            var collected = List<UByte>.newList<UByte>()
+            loop {
+                var sizeLine = reader.readLine()
+                if (sizeLine == null) {
+                    throw new Exception("Truncated chunked response")
+                }
+                // Optional chunk extensions follow a semicolon — ignore.
+                var semi = sizeLine.indexOf(";")
+                if (semi >= 0) {
+                    sizeLine = sizeLine.substring(0UI, semi.toUInt())
+                }
+                sizeLine = sizeLine.trim()
+                if (sizeLine.length() == 0) {
+                    continue
+                }
+                var size = WebClient.parseHexInt(sizeLine)
+                if (size == 0) {
+                    // Trailer headers, then the final blank line.
+                    loop {
+                        var trailer = reader.readLine()
+                        if (trailer == null || trailer.length() == 0) {
+                            break
+                        }
+                    }
+                    break
+                }
+                var chunk = reader.readExact(size)
+                var i = 0
+                while (i < chunk.length().toInt()) {
+                    collected.add(chunk[i.toUInt()])
+                    i++
+                }
+                // Trailing CRLF after the chunk bytes.
+                reader.readLine()
+            }
+            return collected.toArray()
+        }
+
+        private static fun parseHexInt(s: String): Int {
+            var v = 0
+            var i = 0UI
+            while (i < s.length().toUInt()) {
+                var c = s.characterAt(i).toInt()
+                var digit = -1
+                if (c >= 48 && c <= 57) {
+                    digit = c - 48
+                } else if (c >= 97 && c <= 102) {
+                    digit = c - 87
+                } else if (c >= 65 && c <= 70) {
+                    digit = c - 55
+                } else {
+                    throw new Exception("Bad hex digit: " + s)
+                }
+                v = (v * 16) + digit
+                i++
+            }
+            return v
+        }
+
+        // Sniff a default Content-Type from the body shape, the same
+        // way the legacy String-only client did. Only fires when the
+        // caller hasn't already supplied one.
+        private static fun mergeContentType(headers: HashMap<String, String>, data: String): HashMap<String, String> {
+            if (data == null || data.length() == 0) {
+                return headers
+            }
+            if (headers.containsKey("Content-Type") || headers.containsKey("content-type")) {
+                return headers
+            }
+            var copy = new HashMap<String, String>()
+            var keys = headers.buildKeys()
+            var i = 0
+            while (i < keys.getSize()) {
+                var k = keys.get(i)
+                copy.set(k, headers.get(k))
+                i++
+            }
+            if (data.indexOf("{") == 0 && data.indexOf("}") >= 0) {
+                copy.set("Content-Type", "application/json")
+            } else {
+                copy.set("Content-Type", "application/x-www-form-urlencoded")
+            }
+            return copy
         }
     }
 }

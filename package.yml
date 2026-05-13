@@ -1,5 +1,5 @@
 id: am-web-client
-version: 1.0.0
+version: 0.10.0
 type: application
 dependencies:
   - id: am-lang-core
@@ -10,11 +10,18 @@ dependencies:
     url: https://github.com/anderskjeldsen/am-lang-core.git
     features: ["floatingPoint"]
   - id: am-net
-    type: local
-    path: ../am-net
+    realm: github
+    type: git-repo
+    tag: latest
+    branch: master
+    url: https://github.com/anderskjeldsen/am-net.git
   - id: am-ssl
-    type: local
-    path: ../am-ssl
+    realm: github
+    type: git-repo
+    tag: latest
+    branch: master
+    url: https://github.com/anderskjeldsen/am-ssl.git
+
 platforms:
   - id: libc
     abstract: true
@@ -28,8 +35,9 @@ platforms:
     additionalIncludePaths:
     gccAdditionalOptions:
       - -noixemul
+    additionalLinkerFlags:
+      - -noixemul
     gccAdditionalLibraries:
-      - socket
   - id: macos
     extends: libc
     gccCommand: gcc -O3
