@@ -1,5 +1,5 @@
 namespace Am.Web.Client {
-    class HttpResponse(var statusCode: Int, var statusMessage: String, var headers: Map<String, String>, var bodyContent: String) {
+    class HttpResponse(private var statusCode: Int, private var statusMessage: String, private var headers: Map<String, String>, private var bodyContent: String) {
         import Am.Lang
         import Am.IO
         import Am.Collections
