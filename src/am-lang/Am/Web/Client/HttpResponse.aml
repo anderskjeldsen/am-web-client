@@ -1,56 +1,97 @@
 namespace Am.Web.Client {
-    class HttpResponse(private var statusCode: Int, private var statusMessage: String, private var headers: Map<String, String>, private var bodyContent: String) {
+    // Parsed HTTP response. Body is stored as raw bytes so callers
+    // can pull binary payloads (images, packfiles, archives, …) out
+    // intact; the existing String API still works via a UTF-8 decode
+    // and matches what callers wrote before the binary expansion.
+    //
+    // For new binary-aware code prefer `getBodyAsBytes()` — the
+    // String getter assumes the response is UTF-8, which most JSON /
+    // HTML / text APIs satisfy but binary payloads do not.
+    class HttpResponse(private var statusCode: private Int, private var statusMessage: private String,
+                       private var headers: private Map<String, String>, private var bodyBytes: private UByte[]) {
         import Am.Lang
         import Am.IO
         import Am.Collections
-        
+
         fun getStatusCode(): Int {
             return this.statusCode
         }
-        
+
         fun getStatusMessage(): String {
             return this.statusMessage
         }
-        
+
         fun getHeaders(): Map<String, String> {
             return this.headers
         }
-        
+
+        // HTTP header names are case-insensitive on the wire. WebClient
+        // stores them lowercase; for backward compat with callers that
+        // pass mixed-case names ("Content-Type"), we look up the
+        // lowercase form too.
         fun getHeader(name: String): String {
-            return this.headers.get(name)
-        }
-        
-        fun hasHeader(name: String): Bool {
-            return this.headers.containsKey(name)
-        }
-        
-        fun getBodyAsString(): String {
-            return this.bodyContent
-        }
-        
-        fun getBodyAsStream(): Stream {
-            // TODO: Implement proper string to UByte[] conversion
+            if (this.headers.containsKey(name)) {
+                return this.headers.get(name)
+            }
+            var lower = name.toLowerCase()
+            if (this.headers.containsKey(lower)) {
+                return this.headers.get(lower)
+            }
             return null
         }
-        
+
+        fun hasHeader(name: String): Bool {
+            if (this.headers.containsKey(name)) {
+                return true
+            }
+            return this.headers.containsKey(name.toLowerCase())
+        }
+
+        // Body decoded as UTF-8. For non-UTF-8 / binary responses,
+        // use `getBodyAsBytes()` instead — going through this will
+        // mangle bytes that aren't valid UTF-8 sequences.
+        fun getBodyAsString(): String {
+            if (this.bodyBytes == null || this.bodyBytes.length() == 0UI) {
+                return ""
+            }
+            return String.fromBytes(this.bodyBytes, "UTF-8")
+        }
+
+        // Raw response body bytes. Preferred for binary payloads.
+        fun getBodyAsBytes(): UByte[] {
+            return this.bodyBytes
+        }
+
         fun isSuccess(): Bool {
             return this.statusCode >= 200 && this.statusCode < 300
         }
-        
+
         fun isRedirect(): Bool {
             return this.statusCode >= 300 && this.statusCode < 400
         }
-        
+
         fun isClientError(): Bool {
             return this.statusCode >= 400 && this.statusCode < 500
         }
-        
+
         fun isServerError(): Bool {
             return this.statusCode >= 500
         }
-        
+
         override fun toString(): String {
-            return "HTTP " + this.statusCode.toString() + " " + this.statusMessage + " (Body: " + this.bodyContent.length().toString() + " bytes)"
+            var len: UInt = 0UI
+            if (this.bodyBytes != null) {
+                len = this.bodyBytes.length()
+            }
+            var sb = new StringBuilder()
+            sb.add("HTTP ")
+            sb.add(this.statusCode.toString())
+            sb.add(" ")
+            sb.add(this.statusMessage)
+            sb.add(" (Body: ")
+            sb.add(len.toString())
+            sb.add(" bytes)")
+            return sb.toString()
         }
     }
 }

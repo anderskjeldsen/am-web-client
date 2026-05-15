@@ -1,0 +1,145 @@
+namespace Am.Web.Client
+{
+    // Tiny buffered reader on top of a Stream. The underlying SSL_read
+    // / recv calls only deliver "whatever's available right now", so
+    // HTTP framing (read a line, then read exactly N body bytes) needs
+    // a layer that buffers and hands out the precise byte counts the
+    // parser asks for.
+    //
+    // Designed for the common shape of HTTP responses: tens of header
+    // bytes consumed line-by-line, then a body of known length drained
+    // in one shot. Not optimised for arbitrarily long bodies, but
+    // correct for any size up to available memory.
+    class StreamReader(private var stream: Stream)
+    {
+        import Am.Lang
+        import Am.Collections
+        import Am.IO
+
+        private var buffer: UByte[] = new UByte[8192]
+        private var bufferStart: Int = 0
+        private var bufferEnd: Int = 0
+        private var eof: Bool = false
+
+        // Refill the buffer from the underlying stream. Returns false
+        // if the stream signalled EOF.
+        private fun refill(): Bool {
+            if (this.eof) {
+                return false
+            }
+            this.bufferStart = 0
+            this.bufferEnd = 0
+            var n = this.stream.read(this.buffer, 0L, this.buffer.length())
+            if (n <= 0UI) {
+                this.eof = true
+                return false
+            }
+            this.bufferEnd = n.toInt()
+            return true
+        }
+
+        // Read a single byte. Returns -1 at EOF.
+        fun read1(): Int {
+            if (this.bufferStart >= this.bufferEnd) {
+                if (!this.refill()) {
+                    return -1
+                }
+            }
+            var b = this.buffer[this.bufferStart.toUInt()].toInt()
+            this.bufferStart = this.bufferStart + 1
+            return b
+        }
+
+        // Read up to `count` bytes into `dest` starting at `destOffset`.
+        // Returns the number actually read (0 only at EOF).
+        fun readInto(dest: UByte[], destOffset: Int, count: Int): Int {
+            var produced = 0
+            while (produced < count) {
+                if (this.bufferStart >= this.bufferEnd) {
+                    if (!this.refill()) {
+                        return produced
+                    }
+                }
+                var available = this.bufferEnd - this.bufferStart
+                var remaining = count - produced
+                var take = available
+                if (remaining < take) {
+                    take = remaining
+                }
+                var i = 0
+                while (i < take) {
+                    dest[(destOffset + produced + i).toUInt()] =
+                        this.buffer[(this.bufferStart + i).toUInt()]
+                    i++
+                }
+                this.bufferStart = this.bufferStart + take
+                produced = produced + take
+            }
+            return produced
+        }
+
+        // Read exactly `count` bytes. Throws if the stream ends early.
+        fun readExact(count: Int): UByte[] {
+            var out = new UByte[count.toUInt()]
+            var got = 0
+            while (got < count) {
+                var n = this.readInto(out, got, count - got)
+                if (n <= 0) {
+                    throw new Exception("Unexpected EOF — wanted " + count.toString() +
+                                         " bytes, got " + got.toString())
+                }
+                got = got + n
+            }
+            return out
+        }
+
+        // Read a CRLF-terminated line as ASCII. The trailing CRLF is
+        // stripped from the result. A bare LF is also tolerated since
+        // some servers misbehave.
+        fun readLine(): String {
+            var sb = new StringBuilder()
+            var sawCr = false
+            loop {
+                var b = this.read1()
+                if (b < 0) {
+                    if (sb.getLength() == 0UI && !sawCr) {
+                        return null
+                    }
+                    return sb.toString()
+                }
+                if (b == 13) {
+                    sawCr = true
+                } else if (b == 10) {
+                    return sb.toString()
+                } else {
+                    if (sawCr) {
+                        sb.addChar(13US)
+                        sawCr = false
+                    }
+                    sb.addChar(b.toUShort())
+                }
+            }
+            return sb.toString()
+        }
+
+        // Drain the rest of the stream into a byte array. Used for
+        // `Connection: close` responses where the server signals body
+        // end by closing the socket.
+        fun readToEnd(): UByte[] {
+            var out = List<UByte>.newList<UByte>()
+            var chunk = new UByte[4096]
+            loop {
+                var n = this.readInto(chunk, 0, chunk.length().toInt())
+                if (n <= 0) {
+                    break
+                }
+                var i = 0
+                while (i < n) {
+                    out.add(chunk[i.toUInt()])
+                    i++
+                }
+            }
+            return out.toArray()
+        }
+    }
+}
