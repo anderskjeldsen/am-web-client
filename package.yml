@@ -6,20 +6,20 @@ dependencies:
     realm: github
     type: git-repo
     tag: latest
-    branch: master
+#    branch: master
     url: https://github.com/anderskjeldsen/am-lang-core.git
     features: ["floatingPoint"]
   - id: am-net
     realm: github
     type: git-repo
     tag: latest
-    branch: master
+#    branch: master
     url: https://github.com/anderskjeldsen/am-net.git
   - id: am-ssl
     realm: github
     type: git-repo
     tag: latest
-    branch: master
+#    branch: master
     url: https://github.com/anderskjeldsen/am-ssl.git
 
 platforms:
