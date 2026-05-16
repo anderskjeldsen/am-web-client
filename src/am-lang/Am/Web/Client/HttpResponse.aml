@@ -7,8 +7,8 @@ namespace Am.Web.Client {
     // For new binary-aware code prefer `getBodyAsBytes()` — the
     // String getter assumes the response is UTF-8, which most JSON /
     // HTML / text APIs satisfy but binary payloads do not.
-    class HttpResponse(private var statusCode: private Int, private var statusMessage: private String,
-                       private var headers: private Map<String, String>, private var bodyBytes: private UByte[]) {
+    class HttpResponse(private var statusCode: Int, private var statusMessage: String,
+                       private var headers: Map<String, String>, private var bodyBytes: UByte[]) {
         import Am.Lang
         import Am.IO
         import Am.Collections
