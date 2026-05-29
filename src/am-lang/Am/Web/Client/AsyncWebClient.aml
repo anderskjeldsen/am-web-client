@@ -1,0 +1,632 @@
+namespace Am.Web.Client {
+
+    // Suspend-friendly façade over WebClient. Each method schedules the
+    // full sync HTTP exchange (connect + write + read + close) onto the
+    // TaskScheduler IO worker, suspends the caller, then resumes the
+    // caller on the **main thread** by funnelling cont.resume() through
+    // TaskScheduler.schedule(TaskThreadType.Main, ...). The application
+    // is therefore expected to drain Main tasks from its main thread via
+    // `TaskScheduler.handleMainTasks()` from an event loop — if it
+    // doesn't, the suspend chain stalls forever after the IO call
+    // completes (the resume task sits in the Main queue, unpicked).
+    //
+    // Why "wrap sync WebClient on an IO worker" rather than a from-the-
+    // ground-up async HTTP stack: AsyncSocketStream now has full
+    // suspend send/receive/close, but real non-blocking HTTP would
+    // still want TaskScheduler primitives that don't
+    // exist yet (Condition variables, non-blocking socket polling). The
+    // worker-thread approach already keeps the main thread free, which
+    // is the whole point of "handle events on main thread"; full
+    // non-blocking I/O is a future refinement.
+    //
+    // The class is intentionally instance-based even though it holds no
+    // per-request state — it mirrors the sync WebClient's shape so call
+    // sites stay symmetric (`new AsyncWebClient().getAsync(url)` vs
+    // `new WebClient().get(url)`). The suspend codegen fixes that
+    // landed alongside this class (receiver slot in the child state,
+    // and `var_this` mangling in suspend bodies) made the instance
+    // form safe — earlier drafts had to be all `static suspend` to
+    // dodge those bugs.
+    class AsyncWebClient {
+        import Am.Lang
+        import Am.IO
+        import Am.Net
+        import Am.Net.Ssl
+        import Am.Threading
+        import Am.Async
+        import Am.Collections
+
+        // ---- String-based API -------------------------------------------
+
+        // Async-native HTTPS GET. Every blocking step (DNS + connect,
+        // SSL handshake, send, recv) runs as its own suspend dispatch
+        // to TaskScheduler.IO. The caller's coroutine resumes on the IO
+        // worker between steps (matches AsyncSocketStream /
+        // AsyncSecureSocketStream semantics); a final resumeOnMain
+        // hop is done at the very end so the caller of `getAsync`
+        // continues on the Main thread, as existing callers
+        // (cli-search Program.aml, AsyncAminetClient) expect.
+        //
+        // Plain http:// not yet routed through async I/O — that would
+        // be a similar pipeline driven off AsyncSocketStream's
+        // sendAsync / receiveAsync directly. For now, plain HTTP
+        // falls back to the wrap-sync-on-worker path used by
+        // post/put/delete/etc. — sufficient for the current aminet
+        // workload, which is HTTPS-only.
+        suspend fun getAsync(url: String): HttpResponse {
+            "AsyncWebClient.getAsync: entering".println()
+            var parser = new UrlParser()
+            if (!parser.isHttps(url)) {
+                "AsyncWebClient.getAsync: plain http -> wrap-sync fallback".println()
+                return this.getViaWrappedSync(url)
+            }
+            return this.getHttpsAsync(url)
+        }
+
+        // Drives the HTTPS pipeline as a sequence of suspend calls.
+        // Every blocking syscall pops onto TaskScheduler.IO; the
+        // caller's main-thread pump loop stays responsive between
+        // hops. Final resumeOnMain reads the post-call body back onto
+        // Main before returning.
+        private suspend fun getHttpsAsync(url: String): HttpResponse {
+            var parser = new UrlParser()
+            var host = parser.extractHost(url)
+            var port = parser.extractPort(url)
+            var path = parser.extractPath(url)
+
+            // 1. TCP connect + SSL handshake in ONE fused IO-worker
+            // dispatch. The per-task bsdsocket slot setup (inside
+            // Socket.create) and the per-task AmiSSL InitAmiSSL
+            // (inside SslSocketStream's native init) thus pin to the
+            // same Amiga task — no chance of them landing on
+            // different workers.
+            "AsyncWebClient.getAsync: createAsync".println()
+            var sslStream = AsyncSecureSocketStream.createAsync(host, port, host)
+            "AsyncWebClient.getAsync: handshake done".println()
+
+            // 3. Send request bytes (one writeAsync call — small,
+            // single IO dispatch).
+            var requestBytes = AsyncWebClient.buildRequestBytes(
+                "GET", host, port, true, path,
+                new UByte[0UI], new HashMap<String, String>())
+            "AsyncWebClient.getAsync: writeAsync request".println()
+            sslStream.writeAsync(requestBytes, 0L, requestBytes.length())
+
+            // 4. Drain the entire response body in ONE suspend hop.
+            // The drain loop runs inside the IO worker task lambda
+            // with no suspend points inside it — sidesteps the
+            // compiler-generated `__while_breaking` not-saved-across-
+            // suspend codegen gap that breaks per-byte AsyncStreamReader
+            // loops. See [[feedback-amlang-suspend-loop-break]].
+            //
+            // After this returns we have the whole status-line + headers
+            // + body as one UByte[], parsed synchronously below.
+            "AsyncWebClient.getAsync: reading response".println()
+            var raw = sslStream.readToEndAsync(2 * 1024 * 1024)
+            ("AsyncWebClient.getAsync: read " + raw.length().toString()
+                + " bytes total").println()
+            var response = AsyncWebClient.parseResponseBytes(raw)
+            ("AsyncWebClient.getAsync: parsed response status="
+                + response.getStatusCode().toString()
+                + " body-bytes=" + response.getBodyAsBytes().length().toString()).println()
+
+            // 5. Bounce back to Main so existing callers (cli-search
+            // Program.aml, AsyncAminetClient) see the resume on the
+            // Main thread, preserving the public contract of the
+            // pre-refactor wrap-sync version.
+            this.resumeOnMainAsync()
+
+            return response
+        }
+
+        // Fallback path for non-HTTPS URLs — uses the legacy wrap-sync
+        // approach until an AsyncSocketStream exists. Internally
+        // identical to the original getAsync body.
+        private suspend fun getViaWrappedSync(url: String): HttpResponse {
+            var holder = new AsyncWebResult()
+            suspend(cont) {
+                var task: () => Bool = () => {
+                    try {
+                        holder.response = new WebClient().get(url)
+                    } catch (e: Exception) {
+                        holder.errorMessage = e.toString()
+                    }
+                    this.resumeOnMain(cont)
+                    return true
+                }
+                TaskScheduler.schedule(TaskThreadType.IO, task)
+            }
+            if (holder.errorMessage != null) {
+                throw new Exception("AsyncWebClient.getAsync failed: " + holder.errorMessage)
+            }
+            return holder.response
+        }
+
+        // Suspend until a fresh main-thread task picks us up. Used at
+        // the tail of HTTPS getAsync so the caller continues on Main
+        // rather than the IO worker (the natural resume site of the
+        // last sslStream.readAsync). Cheap — just one round-trip
+        // through the main queue.
+        private suspend fun resumeOnMainAsync() {
+            suspend(cont) {
+                var task: () => Bool = () => {
+                    cont.resume()
+                    return true
+                }
+                TaskScheduler.schedule(TaskThreadType.Main, task)
+            }
+        }
+
+        // Build the request line + headers + body block as a single
+        // UByte[]. Pure function — no I/O, no thread concerns. Mirrors
+        // WebClient.sendRequest's layout so server-side parsing is
+        // identical between sync and async paths.
+        private static fun buildRequestBytes(method: String,
+                                              host: String,
+                                              port: Int,
+                                              isHttps: Bool,
+                                              path: String,
+                                              body: UByte[],
+                                              headers: HashMap<String, String>): UByte[] {
+            var sb = new StringBuilder()
+            sb.add(method).add(" ").add(path).add(" HTTP/1.1\r\n")
+            sb.add("Host: ").add(host)
+            if ((isHttps && port != 443) || (!isHttps && port != 80)) {
+                sb.add(":").add(port.toString())
+            }
+            sb.add("\r\n")
+            sb.add("User-Agent: ").add(WebClient.userAgent).add("\r\n")
+            sb.add("Connection: close\r\n")
+            sb.add("Accept-Encoding: identity\r\n")
+
+            var headerKeys = headers.buildKeys()
+            var hi = 0
+            while (hi < headerKeys.getSize()) {
+                var k = headerKeys.get(hi)
+                var v = headers.get(k)
+                sb.add(k).add(": ").add(v).add("\r\n")
+                hi++
+            }
+
+            if (body.length() > 0UI) {
+                sb.add("Content-Length: ").add(body.length().toString()).add("\r\n")
+            }
+            sb.add("\r\n")
+
+            var headBytes = sb.toString().toBytes("UTF-8")
+            if (body.length() == 0UI) {
+                return headBytes
+            }
+            // Concat head + body into one buffer. Single writeAsync is
+            // simpler than a head/body pair and avoids a second
+            // IO-worker round-trip for tiny bodies.
+            var out = new UByte[headBytes.length() + body.length()]
+            var i = 0UI
+            while (i < headBytes.length()) {
+                out[i] = headBytes[i]
+                i++
+            }
+            var j = 0UI
+            while (j < body.length()) {
+                out[headBytes.length() + j] = body[j]
+                j++
+            }
+            return out
+        }
+
+        // Parse a raw HTTP response (status line + headers + body) out
+        // of a single in-memory byte buffer. Synchronous — no I/O, no
+        // suspends. Used by getHttpsAsync once readToEndAsync returns
+        // the whole response. Keeps the line-by-line scanning OUT of
+        // any suspend context.
+        private static fun parseResponseBytes(raw: UByte[]): HttpResponse {
+            var pos = 0
+            var total = raw.length().toInt()
+            // First line — status line.
+            var statusLine = AsyncWebClient.scanLine(raw, pos, total)
+            if (statusLine == null) {
+                return new HttpResponse(0, "No Response",
+                    new HashMap<String, String>(), new UByte[0UI])
+            }
+            pos = AsyncWebClient.advancePastLine(raw, pos, total)
+
+            var statusCode = 0
+            var statusMessage = ""
+            var statusParts = statusLine.splitByString(" ")
+            if (statusParts.length() >= 2UI) {
+                statusCode = Int.parse(statusParts[1UI])
+            }
+            if (statusParts.length() >= 3UI) {
+                var i = 2UI
+                var sbStatus = new StringBuilder()
+                while (i < statusParts.length()) {
+                    if (i > 2UI) {
+                        sbStatus.add(" ")
+                    }
+                    sbStatus.add(statusParts[i])
+                    i++
+                }
+                statusMessage = sbStatus.toString()
+            }
+
+            var headers = new HashMap<String, String>()
+            var contentLength = -1
+            var parsingHeaders = true
+            while (parsingHeaders) {
+                var line = AsyncWebClient.scanLine(raw, pos, total)
+                if (line == null) {
+                    parsingHeaders = false
+                } else {
+                    pos = AsyncWebClient.advancePastLine(raw, pos, total)
+                    if (line.length() == 0) {
+                        parsingHeaders = false
+                    } else {
+                        var colon = line.indexOf(":")
+                        if (colon > 0) {
+                            var nameRaw = line.substring(0UI, colon.toUInt())
+                            var nameLower = nameRaw.toLowerCase()
+                            var name = nameLower.trim()
+                            // substring is (start, LENGTH) — not (start, end).
+                            // Mixing them up sends substring into an
+                            // out-of-bounds loop. Use substringToEnd
+                            // for the rest-of-string variant.
+                            var valueRaw = line.substringToEnd((colon + 1).toUInt())
+                            var value = valueRaw.trim()
+                            headers.set(name, value)
+                            if (name == "content-length") {
+                                contentLength = Int.parse(value)
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Body — everything after the headers, optionally clipped
+            // to Content-Length when present.
+            var bodyStart = pos
+            var bodyLen = total - bodyStart
+            if (contentLength >= 0 && contentLength < bodyLen) {
+                bodyLen = contentLength
+            }
+            var body = new UByte[bodyLen.toUInt()]
+            var b = 0
+            while (b < bodyLen) {
+                body[b.toUInt()] = raw[(bodyStart + b).toUInt()]
+                b = b + 1
+            }
+            return new HttpResponse(statusCode, statusMessage, headers, body)
+        }
+
+        // Scan raw[pos..total) for the next CRLF / LF terminator and
+        // return the substring (excluding the terminator) as an ASCII
+        // String. Returns null when pos == total (no more data).
+        private static fun scanLine(raw: UByte[], pos: Int, total: Int): String {
+            if (pos >= total) {
+                return null
+            }
+            var end = pos
+            var keep = true
+            while (keep) {
+                if (end >= total) {
+                    keep = false
+                } else {
+                    var b = raw[end.toUInt()].toInt()
+                    if (b == 10) {
+                        keep = false
+                    } else {
+                        end = end + 1
+                    }
+                }
+            }
+            // Trim trailing CR (\r) so callers get a clean line.
+            var lineEnd = end
+            if (lineEnd > pos) {
+                var prev = raw[(lineEnd - 1).toUInt()].toInt()
+                if (prev == 13) {
+                    lineEnd = lineEnd - 1
+                }
+            }
+            var sb = new StringBuilder()
+            var i = pos
+            while (i < lineEnd) {
+                sb.addChar(raw[i.toUInt()].toInt().toUShort())
+                i = i + 1
+            }
+            return sb.toString()
+        }
+
+        // Step past the line scanLine just returned — skip the
+        // terminator byte (LF, possibly preceded by CR which is already
+        // off the end count of scanLine's returned string).
+        private static fun advancePastLine(raw: UByte[], pos: Int, total: Int): Int {
+            var end = pos
+            var keep = true
+            while (keep) {
+                if (end >= total) {
+                    keep = false
+                } else {
+                    var b = raw[end.toUInt()].toInt()
+                    if (b == 10) {
+                        keep = false
+                    } else {
+                        end = end + 1
+                    }
+                }
+            }
+            if (end < total) {
+                end = end + 1
+            }
+            return end
+        }
+
+        // OLD async-line-based response reader. Kept for reference but
+        // unused; suspend-codegen gap on `loop`/`while` breaking
+        // variables prevents it from working past the first line.
+        private static suspend fun readResponseAsync(reader: AsyncStreamReader): HttpResponse {
+            var statusLine = reader.readLineAsync()
+            if (statusLine == null) {
+                ("readResponseAsync: statusLine NULL").println()
+                var emptyHeaders = new HashMap<String, String>()
+                return new HttpResponse(0, "No Response", emptyHeaders, new UByte[0UI])
+            }
+            ("readResponseAsync: statusLine='" + statusLine + "' len=" + statusLine.length().toString()).println()
+            var statusParts = statusLine.splitByString(" ")
+            var statusCode = 0
+            var statusMessage = ""
+            if (statusParts.length() >= 2UI) {
+                statusCode = Int.parse(statusParts[1UI])
+            }
+            if (statusParts.length() >= 3UI) {
+                var i = 2UI
+                var sbStatus = new StringBuilder()
+                while (i < statusParts.length()) {
+                    if (i > 2UI) {
+                        sbStatus.add(" ")
+                    }
+                    sbStatus.add(statusParts[i])
+                    i++
+                }
+                statusMessage = sbStatus.toString()
+            }
+
+            var headers = new HashMap<String, String>()
+            var contentLength = -1
+            var headerCount = 0
+            // `loop { … break }` would trip the same suspend-codegen
+            // gap as readLineAsync (compiler-generated __loop_breaking
+            // not saved across suspend). Drive the loop off a
+            // user-declared boolean instead.
+            var keepReadingHeaders = true
+            while (keepReadingHeaders) {
+                var line = reader.readLineAsync()
+                if (line == null) {
+                    ("readResponseAsync: header line " + headerCount.toString()
+                        + " was NULL").println()
+                    keepReadingHeaders = false
+                } else if (line.length() == 0) {
+                    ("readResponseAsync: header line " + headerCount.toString()
+                        + " len=0 (end of headers)").println()
+                    keepReadingHeaders = false
+                } else {
+                    ("readResponseAsync: header line " + headerCount.toString()
+                        + " len=" + line.length().toString()).println()
+                    headerCount = headerCount + 1
+                    var colon = line.indexOf(":")
+                    if (colon > 0) {
+                    // Chained method calls on a local in a loop trip
+                    // the binder ("Can't inject as operator on
+                    // expression"). Splitting into intermediate locals
+                    // sidesteps it.
+                    var nameRaw = line.substring(0UI, colon.toUInt())
+                    var nameLower = nameRaw.toLowerCase()
+                    var name = nameLower.trim()
+                    var valueRaw = line.substring((colon + 1).toUInt(), line.length().toUInt())
+                    var value = valueRaw.trim()
+                    headers.set(name, value)
+                    if (name == "content-length") {
+                        contentLength = Int.parse(value)
+                    }
+                    }
+                }
+            }
+
+            var body: UByte[] = new UByte[0UI]
+            if (contentLength > 0) {
+                body = reader.readExactAsync(contentLength)
+            } else if (contentLength < 0) {
+                // Connection: close — drain until EOF.
+                body = reader.readToEndAsync()
+            }
+            return new HttpResponse(statusCode, statusMessage, headers, body)
+        }
+
+        suspend fun postAsync(url: String, data: String): HttpResponse {
+            var holder = new AsyncWebResult()
+            suspend(cont) {
+                var task: () => Bool = () => {
+                    try {
+                        holder.response = new WebClient().post(url, data)
+                    } catch (e: Exception) {
+                        holder.errorMessage = e.toString()
+                    }
+                    this.resumeOnMain(cont)
+                    return true
+                }
+                TaskScheduler.schedule(TaskThreadType.IO, task)
+            }
+            if (holder.errorMessage != null) {
+                throw new Exception("AsyncWebClient.postAsync failed: " + holder.errorMessage)
+            }
+            return holder.response
+        }
+
+        suspend fun putAsync(url: String, data: String): HttpResponse {
+            var holder = new AsyncWebResult()
+            suspend(cont) {
+                var task: () => Bool = () => {
+                    try {
+                        holder.response = new WebClient().put(url, data)
+                    } catch (e: Exception) {
+                        holder.errorMessage = e.toString()
+                    }
+                    this.resumeOnMain(cont)
+                    return true
+                }
+                TaskScheduler.schedule(TaskThreadType.IO, task)
+            }
+            if (holder.errorMessage != null) {
+                throw new Exception("AsyncWebClient.putAsync failed: " + holder.errorMessage)
+            }
+            return holder.response
+        }
+
+        suspend fun deleteAsync(url: String): HttpResponse {
+            var holder = new AsyncWebResult()
+            suspend(cont) {
+                var task: () => Bool = () => {
+                    try {
+                        holder.response = new WebClient().delete(url)
+                    } catch (e: Exception) {
+                        holder.errorMessage = e.toString()
+                    }
+                    this.resumeOnMain(cont)
+                    return true
+                }
+                TaskScheduler.schedule(TaskThreadType.IO, task)
+            }
+            if (holder.errorMessage != null) {
+                throw new Exception("AsyncWebClient.deleteAsync failed: " + holder.errorMessage)
+            }
+            return holder.response
+        }
+
+        suspend fun getWithHeadersAsync(url: String, headers: HashMap<String, String>): HttpResponse {
+            var holder = new AsyncWebResult()
+            suspend(cont) {
+                var task: () => Bool = () => {
+                    try {
+                        holder.response = new WebClient().getWithHeaders(url, headers)
+                    } catch (e: Exception) {
+                        holder.errorMessage = e.toString()
+                    }
+                    this.resumeOnMain(cont)
+                    return true
+                }
+                TaskScheduler.schedule(TaskThreadType.IO, task)
+            }
+            if (holder.errorMessage != null) {
+                throw new Exception("AsyncWebClient.getWithHeadersAsync failed: " + holder.errorMessage)
+            }
+            return holder.response
+        }
+
+        suspend fun postWithHeadersAsync(url: String, data: String, headers: HashMap<String, String>): HttpResponse {
+            var holder = new AsyncWebResult()
+            suspend(cont) {
+                var task: () => Bool = () => {
+                    try {
+                        holder.response = new WebClient().postWithHeaders(url, data, headers)
+                    } catch (e: Exception) {
+                        holder.errorMessage = e.toString()
+                    }
+                    this.resumeOnMain(cont)
+                    return true
+                }
+                TaskScheduler.schedule(TaskThreadType.IO, task)
+            }
+            if (holder.errorMessage != null) {
+                throw new Exception("AsyncWebClient.postWithHeadersAsync failed: " + holder.errorMessage)
+            }
+            return holder.response
+        }
+
+        // ---- Binary API -------------------------------------------------
+
+        suspend fun getBytesAsync(url: String): HttpResponse {
+            var holder = new AsyncWebResult()
+            suspend(cont) {
+                var task: () => Bool = () => {
+                    try {
+                        holder.response = new WebClient().getBytes(url)
+                    } catch (e: Exception) {
+                        holder.errorMessage = e.toString()
+                    }
+                    this.resumeOnMain(cont)
+                    return true
+                }
+                TaskScheduler.schedule(TaskThreadType.IO, task)
+            }
+            if (holder.errorMessage != null) {
+                throw new Exception("AsyncWebClient.getBytesAsync failed: " + holder.errorMessage)
+            }
+            return holder.response
+        }
+
+        suspend fun postBytesAsync(url: String, data: UByte[]): HttpResponse {
+            var holder = new AsyncWebResult()
+            suspend(cont) {
+                var task: () => Bool = () => {
+                    try {
+                        holder.response = new WebClient().postBytes(url, data)
+                    } catch (e: Exception) {
+                        holder.errorMessage = e.toString()
+                    }
+                    this.resumeOnMain(cont)
+                    return true
+                }
+                TaskScheduler.schedule(TaskThreadType.IO, task)
+            }
+            if (holder.errorMessage != null) {
+                throw new Exception("AsyncWebClient.postBytesAsync failed: " + holder.errorMessage)
+            }
+            return holder.response
+        }
+
+        suspend fun getBytesWithHeadersAsync(url: String, headers: HashMap<String, String>): HttpResponse {
+            var holder = new AsyncWebResult()
+            suspend(cont) {
+                var task: () => Bool = () => {
+                    try {
+                        holder.response = new WebClient().getBytesWithHeaders(url, headers)
+                    } catch (e: Exception) {
+                        holder.errorMessage = e.toString()
+                    }
+                    this.resumeOnMain(cont)
+                    return true
+                }
+                TaskScheduler.schedule(TaskThreadType.IO, task)
+            }
+            if (holder.errorMessage != null) {
+                throw new Exception("AsyncWebClient.getBytesWithHeadersAsync failed: " + holder.errorMessage)
+            }
+            return holder.response
+        }
+
+        // Bounce a continuation resume back onto the main-thread queue.
+        // Called from the IO worker once the HTTP exchange is done — the
+        // post-suspend body then runs inside whichever
+        // handleMainTasks() drain picks the resume task up.
+        //
+        // Hoisted to a static helper so the IO-worker lambda doesn't
+        // have to inline yet another lambda (inline `new`-as-arg lambdas
+        // have NPE'd the renderer historically).
+        private fun resumeOnMain(cont: Continuation) {
+            var resumeTask: () => Bool = () => {
+                cont.resume()
+                return true
+            }
+            TaskScheduler.schedule(TaskThreadType.Main, resumeTask)
+        }
+    }
+
+    // Plain mutable holder — the IO worker writes one of `response`
+    // (success) or `errorMessage` (failure) before resuming the
+    // continuation. Internal to AsyncWebClient; callers see only
+    // HttpResponse or a thrown Exception.
+    class AsyncWebResult {
+        import Am.Lang
+
+        var response: HttpResponse
+        var errorMessage: String
+    }
+}

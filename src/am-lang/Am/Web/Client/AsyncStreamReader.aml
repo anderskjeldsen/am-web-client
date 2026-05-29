@@ -1,0 +1,189 @@
+namespace Am.Web.Client
+{
+    // Suspend-friendly buffered reader on top of AsyncSecureSocketStream.
+    // Mirrors StreamReader (the sync sibling for plain Stream) — same
+    // refill/buffer model, same readLine / readExact / readToEnd
+    // semantics — but every underlying read is a suspend dispatch to
+    // the IO TaskScheduler thread.
+    //
+    // Designed for the common HTTP-response shape: tens of header
+    // bytes consumed line-by-line, then a body of known length drained
+    // in one shot. Used by AsyncWebClient.getAsync's HTTPS pipeline.
+    //
+    // Scope today: HTTPS only (wraps AsyncSecureSocketStream). When an
+    // AsyncSocketStream lands for plain HTTP we'll add a parallel
+    // reader or generalise this one over a common async stream
+    // interface — depends on whether the suspend-fn type system can
+    // express that without tripping the binder.
+    class AsyncStreamReader(private var stream: AsyncSecureSocketStream)
+    {
+        import Am.Lang
+        import Am.Collections
+        import Am.Net.Ssl
+
+        // 8 KB buffer — same as StreamReader. Generous enough that a
+        // typical HTTPS response's headers fit in one refill, while
+        // still chunking large bodies through manageable suspend
+        // dispatches.
+        private var buffer: Byte[] = new Byte[8192]
+        private var bufferStart: Int = 0
+        private var bufferEnd: Int = 0
+        private var eof: Bool = false
+
+        // Refill the buffer via one suspend readAsync dispatch. Returns
+        // false when the underlying stream signalled EOF (server
+        // closed for a Connection: close response, or 0 bytes from
+        // SSL_read).
+        private suspend fun refill(): Bool {
+            if (this.eof) {
+                return false
+            }
+            this.bufferStart = 0
+            this.bufferEnd = 0
+            // Hoist `this.stream` and `this.buffer` to locals before
+            // the suspend call — the binder rejects chained `this.X`
+            // accesses across a suspend boundary with "Can't inject
+            // as operator on expression without evaluating expression
+            // 'this'". Same workaround used elsewhere in this file.
+            var stream = this.stream
+            var buf = this.buffer
+            var bufLen = buf.length()
+            var n = stream.readAsync(buf, 0L, bufLen)
+            if (n <= 0) {
+                this.eof = true
+                return false
+            }
+            this.bufferEnd = n
+            return true
+        }
+
+        // Read a single byte. Returns -1 at EOF.
+        suspend fun read1(): Int {
+            if (this.bufferStart >= this.bufferEnd) {
+                if (!this.refill()) {
+                    return -1
+                }
+            }
+            // Bytes are signed 8-bit in AmLang; promote via & 0xFF so
+            // 0x80..0xFF read back as 128..255 rather than -128..-1.
+            // Matters because the consumers treat the value as an
+            // ASCII / unsigned octet (line parsing, body bytes).
+            var b = this.buffer[this.bufferStart.toUInt()].toInt() & 0xFF
+            this.bufferStart = this.bufferStart + 1
+            return b
+        }
+
+        // Read up to `count` bytes into `dest` starting at `destOffset`.
+        // Returns the number actually read (0 only at EOF).
+        suspend fun readIntoAsync(dest: UByte[], destOffset: Int, count: Int): Int {
+            var produced = 0
+            while (produced < count) {
+                if (this.bufferStart >= this.bufferEnd) {
+                    if (!this.refill()) {
+                        return produced
+                    }
+                }
+                var available = this.bufferEnd - this.bufferStart
+                var remaining = count - produced
+                var take = available
+                if (remaining < take) {
+                    take = remaining
+                }
+                var i = 0
+                while (i < take) {
+                    dest[(destOffset + produced + i).toUInt()] =
+                        (this.buffer[(this.bufferStart + i).toUInt()].toInt() & 0xFF).toUByte()
+                    i++
+                }
+                this.bufferStart = this.bufferStart + take
+                produced = produced + take
+            }
+            return produced
+        }
+
+        // Read exactly `count` bytes. Throws if the stream ends early.
+        suspend fun readExactAsync(count: Int): UByte[] {
+            var out = new UByte[count.toUInt()]
+            var got = 0
+            while (got < count) {
+                var n = this.readIntoAsync(out, got, count - got)
+                if (n <= 0) {
+                    throw new Exception("Unexpected EOF — wanted " + count.toString() +
+                                         " bytes, got " + got.toString())
+                }
+                got = got + n
+            }
+            return out
+        }
+
+        // Read a CRLF-terminated line as ASCII. The trailing CRLF is
+        // stripped from the result. A bare LF is also tolerated since
+        // some servers misbehave.
+        //
+        // Loop shape uses an explicit user-declared `keepGoing` local
+        // rather than `loop { … break … }`. Reason: the codegen for
+        // `loop`'s break uses a compiler-generated `__loop_breaking`
+        // local that isn't saved across suspend points, so when read1
+        // resumes after a refill the flag holds stack garbage and the
+        // while wrapper exits after a single iteration — yielding a
+        // 1-char status line, see
+        // [[feedback-amlang-suspend-loop-break]].
+        suspend fun readLineAsync(): String {
+            var sb = new StringBuilder()
+            var sawCr = false
+            var keepGoing = true
+            var result: String = null
+            var sawAny = false
+            while (keepGoing) {
+                var b = this.read1()
+                if (b < 0) {
+                    if (!sawAny && !sawCr) {
+                        result = null
+                    } else {
+                        result = sb.toString()
+                    }
+                    keepGoing = false
+                } else if (b == 13) {
+                    sawCr = true
+                    sawAny = true
+                } else if (b == 10) {
+                    result = sb.toString()
+                    keepGoing = false
+                } else {
+                    if (sawCr) {
+                        sb.addChar(13US)
+                        sawCr = false
+                    }
+                    sb.addChar(b.toUShort())
+                    sawAny = true
+                }
+            }
+            return result
+        }
+
+        // Drain the rest of the stream into a byte array. Used for
+        // `Connection: close` responses where the server signals body
+        // end by closing the socket.
+        //
+        // Same `keepGoing` workaround as readLineAsync — `loop`'s
+        // break wouldn't survive readIntoAsync's suspend.
+        suspend fun readToEndAsync(): UByte[] {
+            var out = List<UByte>.newList<UByte>()
+            var chunk = new UByte[4096]
+            var keepGoing = true
+            while (keepGoing) {
+                var n = this.readIntoAsync(chunk, 0, chunk.length().toInt())
+                if (n <= 0) {
+                    keepGoing = false
+                } else {
+                    var i = 0
+                    while (i < n) {
+                        out.add(chunk[i.toUInt()])
+                        i++
+                    }
+                }
+            }
+            return out.toArray()
+        }
+    }
+}
