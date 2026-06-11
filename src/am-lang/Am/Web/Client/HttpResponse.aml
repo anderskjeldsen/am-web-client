@@ -29,7 +29,7 @@ namespace Am.Web.Client {
         // stores them lowercase; for backward compat with callers that
         // pass mixed-case names ("Content-Type"), we look up the
         // lowercase form too.
-        fun getHeader(name: String): String {
+        fun getHeader(name: String): String? {
             if (this.headers.containsKey(name)) {
                 return this.headers.get(name)
             }

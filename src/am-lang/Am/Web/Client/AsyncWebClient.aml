@@ -300,7 +300,7 @@ namespace Am.Web.Client {
         // Scan raw[pos..total) for the next CRLF / LF terminator and
         // return the substring (excluding the terminator) as an ASCII
         // String. Returns null when pos == total (no more data).
-        private static fun scanLine(raw: UByte[], pos: Int, total: Int): String {
+        private static fun scanLine(raw: UByte[], pos: Int, total: Int): String? {
             if (pos >= total) {
                 return null
             }
@@ -626,7 +626,7 @@ namespace Am.Web.Client {
     class AsyncWebResult {
         import Am.Lang
 
-        var response: HttpResponse
-        var errorMessage: String
+        var response: HttpResponse? = null
+        var errorMessage: String? = null
     }
 }

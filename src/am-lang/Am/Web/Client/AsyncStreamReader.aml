@@ -132,7 +132,7 @@ namespace Am.Web.Client
             var sb = new StringBuilder()
             var sawCr = false
             var keepGoing = true
-            var result: String = null
+            var result: String? = null
             var sawAny = false
             while (keepGoing) {
                 var b = this.read1()

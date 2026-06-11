@@ -96,7 +96,7 @@ namespace Am.Web.Client
         // Read a CRLF-terminated line as ASCII. The trailing CRLF is
         // stripped from the result. A bare LF is also tolerated since
         // some servers misbehave.
-        fun readLine(): String {
+        fun readLine(): String? {
             var sb = new StringBuilder()
             var sawCr = false
             loop {
