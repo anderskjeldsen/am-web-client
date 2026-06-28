@@ -517,6 +517,9 @@ namespace Am.Web.Client {
             if (holder.errorMessage != null) {
                 throw new Exception("AsyncWebClient.getWithHeadersAsync failed: " + holder.errorMessage)
             }
+            if (holder.response == null) {
+                throw new Exception("AsyncWebClient.getWithHeadersAsync: no response (IO worker exited without setting response or errorMessage)")
+            }
             return holder.response
         }
 
@@ -536,6 +539,9 @@ namespace Am.Web.Client {
             }
             if (holder.errorMessage != null) {
                 throw new Exception("AsyncWebClient.postWithHeadersAsync failed: " + holder.errorMessage)
+            }
+            if (holder.response == null) {
+                throw new Exception("AsyncWebClient.postWithHeadersAsync: no response (IO worker exited without setting response or errorMessage)")
             }
             return holder.response
         }

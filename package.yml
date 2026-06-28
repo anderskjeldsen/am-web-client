@@ -59,12 +59,20 @@ platforms:
   - id: linux-x64
     extends: libc
     gccCommand: gcc -O3
+  - id: linux-ppc32
+    extends: libc
+    gccCommand: powerpc-linux-gnu-gcc -O1
+    gccAdditionalOptions:
+      - -pthread
     additionalHeaders:
     additionalAsmSources:
-    additionalCSources: 
+    additionalCSources:
     additionalIncludePaths:
     gccAdditionalOptions:
     gccAdditionalLibraries:
+  - id: linux-ppc64
+    extends: linux-ppc32
+    gccCommand: powerpc-linux-gnu-gcc -O2
 
 buildTargets:
   - id: amigaos_docker
