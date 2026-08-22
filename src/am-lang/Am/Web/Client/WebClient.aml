@@ -12,6 +12,12 @@ namespace Am.Web.Client {
     // close (no keepalive), there's no automatic redirect following,
     // and the response body is buffered fully in memory.
     class WebClient {
+
+        // Receive timeout in seconds applied to each request's socket
+        // (0 = block forever, the historical behaviour). A stalled server
+        // then errors the read instead of hanging the caller.
+        var timeoutSeconds: Int = 0
+
         import Am.Lang
         import Am.Net
         import Am.Net.Ssl
@@ -113,6 +119,9 @@ namespace Am.Web.Client {
 
             var socket = Socket.create(AddressFamily.inet, SocketType.stream, ProtocolFamily.unspecified)
             socket.connect(host, port)
+            if (this.timeoutSeconds > 0) {
+                socket.setReceiveTimeout(this.timeoutSeconds)
+            }
 
             // The compiler currently can't take a Stream-typed local
             // assigned from either branch of an if, so we just inline
@@ -248,7 +257,11 @@ namespace Am.Web.Client {
         }
 
         private static fun readChunkedBody(reader: StreamReader): UByte[] {
-            var collected = List<UByte>.newList<UByte>()
+            // Block-append each decoded chunk into a doubling buffer
+            // rather than the old per-byte List<UByte>.add — the latter
+            // boxed one element per body byte, which pinned the CPU +
+            // heap on a large download (see ByteAccumulator).
+            var collected = new ByteAccumulator()
             loop {
                 var sizeLine = reader.readLine()
                 if (sizeLine == null) {
@@ -275,11 +288,7 @@ namespace Am.Web.Client {
                     break
                 }
                 var chunk = reader.readExact(size)
-                var i = 0
-                while (i < chunk.length().toInt()) {
-                    collected.add(chunk[i.toUInt()])
-                    i++
-                }
+                collected.append(chunk, chunk.length().toInt())
                 // Trailing CRLF after the chunk bytes.
                 reader.readLine()
             }

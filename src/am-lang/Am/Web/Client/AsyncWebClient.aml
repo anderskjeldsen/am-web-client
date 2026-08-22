@@ -54,10 +54,10 @@ namespace Am.Web.Client {
         // post/put/delete/etc. — sufficient for the current aminet
         // workload, which is HTTPS-only.
         suspend fun getAsync(url: String): HttpResponse {
-            "AsyncWebClient.getAsync: entering".println()
+            // "AsyncWebClient.getAsync: entering".println()
             var parser = new UrlParser()
             if (!parser.isHttps(url)) {
-                "AsyncWebClient.getAsync: plain http -> wrap-sync fallback".println()
+                // "AsyncWebClient.getAsync: plain http -> wrap-sync fallback".println()
                 return this.getViaWrappedSync(url)
             }
             return this.getHttpsAsync(url)
@@ -80,16 +80,16 @@ namespace Am.Web.Client {
             // (inside SslSocketStream's native init) thus pin to the
             // same Amiga task — no chance of them landing on
             // different workers.
-            "AsyncWebClient.getAsync: createAsync".println()
+            // "AsyncWebClient.getAsync: createAsync".println()
             var sslStream = AsyncSecureSocketStream.createAsync(host, port, host)
-            "AsyncWebClient.getAsync: handshake done".println()
+            // "AsyncWebClient.getAsync: handshake done".println()
 
             // 3. Send request bytes (one writeAsync call — small,
             // single IO dispatch).
             var requestBytes = AsyncWebClient.buildRequestBytes(
                 "GET", host, port, true, path,
                 new UByte[0UI], new HashMap<String, String>())
-            "AsyncWebClient.getAsync: writeAsync request".println()
+            // "AsyncWebClient.getAsync: writeAsync request".println()
             sslStream.writeAsync(requestBytes, 0L, requestBytes.length())
 
             // 4. Drain the entire response body in ONE suspend hop.
@@ -101,14 +101,14 @@ namespace Am.Web.Client {
             //
             // After this returns we have the whole status-line + headers
             // + body as one UByte[], parsed synchronously below.
-            "AsyncWebClient.getAsync: reading response".println()
+            // "AsyncWebClient.getAsync: reading response".println()
             var raw = sslStream.readToEndAsync(2 * 1024 * 1024)
-            ("AsyncWebClient.getAsync: read " + raw.length().toString()
-                + " bytes total").println()
+            // ("AsyncWebClient.getAsync: read " + raw.length().toString()
+            //     + " bytes total").println()
             var response = AsyncWebClient.parseResponseBytes(raw)
-            ("AsyncWebClient.getAsync: parsed response status="
-                + response.getStatusCode().toString()
-                + " body-bytes=" + response.getBodyAsBytes().length().toString()).println()
+            // ("AsyncWebClient.getAsync: parsed response status="
+            //     + response.getStatusCode().toString()
+            //     + " body-bytes=" + response.getBodyAsBytes().length().toString()).println()
 
             // 5. Bounce back to Main so existing callers (cli-search
             // Program.aml, AsyncAminetClient) see the resume on the

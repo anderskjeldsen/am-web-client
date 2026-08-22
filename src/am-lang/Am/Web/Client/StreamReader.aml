@@ -125,21 +125,84 @@ namespace Am.Web.Client
         // Drain the rest of the stream into a byte array. Used for
         // `Connection: close` responses where the server signals body
         // end by closing the socket.
+        //
+        // Accumulates through a ByteAccumulator (bulk block copies into
+        // a doubling buffer) instead of the old per-byte
+        // List<UByte>.add. On a large download the per-byte path
+        // allocated one boxed list element for EVERY byte — hundreds of
+        // thousands of tiny ARC allocations that pinned the CPU (and
+        // churned memory) on Amiga. The block-copy path touches each
+        // byte a couple of times with zero per-byte allocation.
         fun readToEnd(): UByte[] {
-            var out = List<UByte>.newList<UByte>()
-            var chunk = new UByte[4096]
-            loop {
+            var acc = new ByteAccumulator()
+            var chunk = new UByte[8192]
+            var reading = true
+            while (reading) {
                 var n = this.readInto(chunk, 0, chunk.length().toInt())
                 if (n <= 0) {
-                    break
-                }
-                var i = 0
-                while (i < n) {
-                    out.add(chunk[i.toUInt()])
-                    i++
+                    reading = false
+                } else {
+                    acc.append(chunk, n)
                 }
             }
-            return out.toArray()
+            return acc.toArray()
+        }
+    }
+
+    // Growable byte buffer that appends whole blocks at once and doubles
+    // its capacity as needed. Exists so the HTTP body readers
+    // (StreamReader.readToEnd + WebClient.readChunkedBody) can assemble a
+    // multi-hundred-KB download without a per-byte List<UByte>.add — the
+    // boxed-per-byte accumulation was the CPU/heap spike seen while
+    // downloading on Amiga.
+    class ByteAccumulator {
+        import Am.Lang
+
+        private var buf: UByte[] = new UByte[16384]
+        private var count: Int = 0
+
+        // Copy the first `n` bytes of `src` onto the end of the buffer,
+        // growing (by doubling) first when they wouldn't fit.
+        fun append(src: UByte[], n: Int) {
+            if (n <= 0) {
+                return
+            }
+            this.ensure(this.count + n)
+            var i = 0
+            while (i < n) {
+                this.buf[(this.count + i).toUInt()] = src[i.toUInt()]
+                i = i + 1
+            }
+            this.count = this.count + n
+        }
+
+        private fun ensure(needed: Int) {
+            var cap = this.buf.length().toInt()
+            if (needed <= cap) {
+                return
+            }
+            var newCap = cap
+            while (newCap < needed) {
+                newCap = newCap * 2
+            }
+            var nb = new UByte[newCap.toUInt()]
+            var i = 0
+            while (i < this.count) {
+                nb[i.toUInt()] = this.buf[i.toUInt()]
+                i = i + 1
+            }
+            this.buf = nb
+        }
+
+        // The exact-size result (a fresh array trimmed to `count`).
+        fun toArray(): UByte[] {
+            var out = new UByte[this.count.toUInt()]
+            var i = 0
+            while (i < this.count) {
+                out[i.toUInt()] = this.buf[i.toUInt()]
+                i = i + 1
+            }
+            return out
         }
     }
 }
