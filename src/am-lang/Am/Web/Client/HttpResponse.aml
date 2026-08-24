@@ -79,11 +79,9 @@ namespace Am.Web.Client {
         }
 
         override fun toString(): String {
-            var len: UInt = 0UI
-            if (this.bodyBytes != null) {
-                len = this.bodyBytes.length()
-            }
-            var sb = new StringBuilder()
+            var len: UInt = this.bodyBytes?.length() ?? 0UI
+            try {
+            var sb = new StringBuilder()            
             sb.add("HTTP ")
             sb.add(this.statusCode.toString())
             sb.add(" ")
@@ -92,6 +90,9 @@ namespace Am.Web.Client {
             sb.add(len.toString())
             sb.add(" bytes)")
             return sb.toString()
+            } catch (e: Exception) {
+                return "HTTP response toString() failed: " + e.toString()
+            }
         }
     }
 }
