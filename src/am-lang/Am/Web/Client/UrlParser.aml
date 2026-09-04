@@ -44,11 +44,16 @@ namespace Am.Web.Client {
                 defaultPort = 443
             }
 
-            // Look for port number after colon
+            // Look for a port number after a colon — but ONLY inside the
+            // authority, i.e. before the first "/". A colon later in the URL
+            // belongs to the PATH and is not a port: Google's APIs use one as
+            // the method separator ("/v1beta/models/<model>:generateContent"),
+            // and reading that as a port produced a negative-length substring
+            // and a connect to nowhere ("Unable to connect to host").
             var colonIndex = urlCopy.indexOf(":")
             var slashIndex = urlCopy.indexOf("/")
-            
-            if (colonIndex >= 0) {
+
+            if (colonIndex >= 0 && (slashIndex < 0 || colonIndex < slashIndex)) {
                 var endIndex = urlCopy.length()
                 if (slashIndex >= 0) {
                     endIndex = slashIndex

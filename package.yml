@@ -83,14 +83,15 @@ platforms:
     extends: aros
     gccCommand: aarch64-aros-gcc -O2
     gccAdditionalOptions:
-      - -pthread
+      - -fno-common   # AROS's loader REFUSES COMMON symbols; gcc 6.5.0 defaults to -fcommon
+      - -D_REENTRANT  # aarch64-aros-gcc rejects -pthread outright
     additionalLinkerFlags:
-      - -pthread
+      - -lpthread     # no driver links it without -pthread, which AROS gcc rejects
 buildTargets:
   - id: aros-arm64-docker
     platform: aros-arm64
     dockerBuild:
-      image: aros-arm64-dev:sdk
+      image: aros-arm64-native:latest
       buildPath: /host
   - id: amigaos_docker
     platform: amigaos
