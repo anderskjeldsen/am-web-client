@@ -175,7 +175,9 @@ namespace Am.Web.Client {
                 sb.add(":").add(port.toString())
             }
             sb.add("\r\n")
-            sb.add("User-Agent: ").add(WebClient.userAgent).add("\r\n")
+            if (!WebClient.hasHeader(headers, "user-agent")) {
+                sb.add("User-Agent: ").add(WebClient.userAgent).add("\r\n")
+            }
             sb.add("Connection: close\r\n")
             sb.add("Accept-Encoding: identity\r\n")
 

@@ -26,6 +26,17 @@ namespace Am.Web.Client {
 
         static var userAgent: String = "AmLang-WebClient/1.0"
 
+        // Explicit headers override the default instead of emitting two values.
+        static fun hasHeader(headers: HashMap<String, String>, name: String): Bool {
+            var keys = headers.buildKeys()
+            var i = 0
+            while (i < keys.getSize()) {
+                if (keys.get(i).toLowerCase() == name) { return true }
+                i++
+            }
+            return false
+        }
+
         // ---- String-based API (existing) --------------------------------
 
         fun get(url: String): HttpResponse {
@@ -160,7 +171,9 @@ namespace Am.Web.Client {
                 sb.add(":").add(port.toString())
             }
             sb.add("\r\n")
-            sb.add("User-Agent: ").add(WebClient.userAgent).add("\r\n")
+            if (!WebClient.hasHeader(headers, "user-agent")) {
+                sb.add("User-Agent: ").add(WebClient.userAgent).add("\r\n")
+            }
             sb.add("Connection: close\r\n")
             sb.add("Accept-Encoding: identity\r\n")
 

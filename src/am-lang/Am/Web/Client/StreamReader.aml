@@ -66,12 +66,8 @@ namespace Am.Web.Client
                 if (remaining < take) {
                     take = remaining
                 }
-                var i = 0
-                while (i < take) {
-                    dest[(destOffset + produced + i).toUInt()] =
-                        this.buffer[(this.bufferStart + i).toUInt()]
-                    i++
-                }
+                this.buffer.copyTo(dest, (destOffset + produced).toUInt(),
+                                   this.bufferStart.toUInt(), take.toUInt())
                 this.bufferStart = this.bufferStart + take
                 produced = produced + take
             }
@@ -168,11 +164,7 @@ namespace Am.Web.Client
                 return
             }
             this.ensure(this.count + n)
-            var i = 0
-            while (i < n) {
-                this.buf[(this.count + i).toUInt()] = src[i.toUInt()]
-                i = i + 1
-            }
+            src.copyTo(this.buf, this.count.toUInt(), 0UI, n.toUInt())
             this.count = this.count + n
         }
 
@@ -186,23 +178,13 @@ namespace Am.Web.Client
                 newCap = newCap * 2
             }
             var nb = new UByte[newCap.toUInt()]
-            var i = 0
-            while (i < this.count) {
-                nb[i.toUInt()] = this.buf[i.toUInt()]
-                i = i + 1
-            }
+            this.buf.copyTo(nb, 0UI, 0UI, this.count.toUInt())
             this.buf = nb
         }
 
         // The exact-size result (a fresh array trimmed to `count`).
         fun toArray(): UByte[] {
-            var out = new UByte[this.count.toUInt()]
-            var i = 0
-            while (i < this.count) {
-                out[i.toUInt()] = this.buf[i.toUInt()]
-                i = i + 1
-            }
-            return out
+            return this.buf.subArray(0UI, this.count.toUInt())
         }
     }
 }
