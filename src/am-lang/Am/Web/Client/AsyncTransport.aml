@@ -1,0 +1,85 @@
+namespace Am.Web.Client
+{
+    // One HTTP answer, as data.
+    class AsyncHttpAnswer(var status: Int, var statusMessage: String,
+                          var body: String, var error: String) {
+        import Am.Lang
+
+        // Filled instead of `body` when bytes were asked for.
+        var bodyBytes: UByte[]? = null
+
+        fun isSuccess(): Bool {
+            var ok = false
+            if (this.error == null || this.error.length() == 0) {
+                ok = this.status >= 200 && this.status < 300
+            }
+            return ok
+        }
+    }
+
+    // How a library makes an HTTP request without knowing what kind of
+    // program it is in.
+    //
+    // The default BLOCKS, which is the right answer nearly everywhere: a
+    // command-line tool has nothing else to do, and a worker thread exists
+    // precisely to wait. An application with a window installs its own,
+    // which hands the work to a worker and suspends the caller instead --
+    // see am-ide's BusTransport.
+    //
+    // `current` is a static, so it is per isolate: Main gets whatever the
+    // application installed, and a worker gets the blocking default without
+    // anyone arranging it. The same library code is correct in both.
+    //
+    // This replaces AsyncWebClient's suspend methods for library use. Those
+    // schedule a lambda holding the result AND the continuation onto another
+    // thread; under share-nothing threads that copies both, and the caller
+    // resumes into a frame whose objects belong to another heap.
+    class AsyncTransport() {
+        import Am.Lang
+        import Am.Collections
+
+        static var current: AsyncTransport = new AsyncTransport()
+
+        // `method` is "GET" or "POST". Never throws: a transport failure
+        // comes back in `error`, because the caller is usually a suspend
+        // function whose exception path is the awkward one.
+        open suspend fun request(method: String, url: String, body: String,
+                                 headers: HashMap<String, String>,
+                                 wantBytes: Bool): AsyncHttpAnswer {
+            var answer = new AsyncHttpAnswer(0, "", "", "")
+            try {
+                var client = new WebClient()
+                var resp: HttpResponse? = null
+                if (method.equals("POST")) {
+                    resp = client.postWithHeaders(url, body, headers)
+                } else if (wantBytes) {
+                    resp = client.getBytesWithHeaders(url, headers)
+                } else {
+                    resp = client.getWithHeaders(url, headers)
+                }
+                if (resp == null) {
+                    answer.error = "No response from " + url
+                } else {
+                    var r = resp as HttpResponse
+                    answer.status = r.getStatusCode()
+                    answer.statusMessage = r.getStatusMessage()
+                    if (wantBytes) {
+                        answer.bodyBytes = r.getBodyAsBytes()
+                    } else {
+                        var s = r.getBodyAsString()
+                        if (s != null) {
+                            answer.body = s
+                        }
+                    }
+                }
+            } catch (e: Exception) {
+                var m = e.message
+                if (m == null || m.length() == 0) {
+                    m = "The request could not be sent."
+                }
+                answer.error = m
+            }
+            return answer
+        }
+    }
+}
