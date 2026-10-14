@@ -2,6 +2,8 @@
 
 A comprehensive HTTP/HTTPS client library for AmLang applications, providing easy-to-use web request functionality with SSL/TLS support.
 
+See the [concurrent networking roadmap](ROADMAP.md) for the proposed shared network thread and synchronous/asynchronous APIs across `am-net`, `am-ssl`, and `am-web-client`.
+
 ## Features
 
 - **HTTP/HTTPS Support**: Full support for both HTTP and HTTPS protocols with SSL/TLS encryption
