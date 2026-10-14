@@ -17,6 +17,8 @@ namespace Am.Web.Client {
         // (0 = block forever, the historical behaviour). A stalled server
         // then errors the read instead of hanging the caller.
         var timeoutSeconds: Int = 0
+        // Zero preserves the existing unlimited API. Browser callers set a cap.
+        var maxResponseBytes: Int = 0
 
         import Am.Lang
         import Am.Net
@@ -129,6 +131,7 @@ namespace Am.Web.Client {
             var isHttps = parser.isHttps(url)
 
             var socket = Socket.create(AddressFamily.inet, SocketType.stream, ProtocolFamily.unspecified)
+            try {
             socket.connect(host, port)
             if (this.timeoutSeconds > 0) {
                 socket.setReceiveTimeout(this.timeoutSeconds)
@@ -141,17 +144,16 @@ namespace Am.Web.Client {
                 var sslStream = new SslSocketStream(socket, host)
                 WebClient.sendRequest(sslStream, method, host, port, isHttps, path, body, headers)
                 var reader = new StreamReader(sslStream)
-                var response = WebClient.readResponse(reader)
-                socket.close()
+                var response = WebClient.readResponse(reader, this.maxResponseBytes)
                 return response
             } else {
                 var plainStream = new SocketStream(socket)
                 WebClient.sendRequest(plainStream, method, host, port, isHttps, path, body, headers)
                 var reader = new StreamReader(plainStream)
-                var response = WebClient.readResponse(reader)
-                socket.close()
+                var response = WebClient.readResponse(reader, this.maxResponseBytes)
                 return response
             }
+            } finally { socket.close() }
         }
 
         // ---- Request writing -------------------------------------------
@@ -203,7 +205,7 @@ namespace Am.Web.Client {
 
         // ---- Response reading ------------------------------------------
 
-        private static fun readResponse(reader: StreamReader): HttpResponse {
+        private static fun readResponse(reader: StreamReader, limit: Int): HttpResponse {
             var statusLine = reader.readLine()
             if (statusLine == null) {
                 var emptyHeaders = new HashMap<String, String>()
@@ -245,15 +247,15 @@ namespace Am.Web.Client {
                 }
             }
 
-            var body = WebClient.readBody(reader, headers)
+            var body = WebClient.readBody(reader, headers, limit)
             return new HttpResponse(statusCode, statusMessage, headers, body)
         }
 
-        private static fun readBody(reader: StreamReader, headers: HashMap<String, String>): UByte[] {
+        private static fun readBody(reader: StreamReader, headers: HashMap<String, String>, limit: Int): UByte[] {
             if (headers.containsKey("transfer-encoding")) {
                 var te = headers.get("transfer-encoding").toLowerCase()
                 if (te.indexOf("chunked") >= 0) {
-                    return WebClient.readChunkedBody(reader)
+                    return WebClient.readChunkedBody(reader, limit)
                 }
             }
             if (headers.containsKey("content-length")) {
@@ -262,19 +264,21 @@ namespace Am.Web.Client {
                 if (n <= 0) {
                     return new UByte[0UI]
                 }
+                if (limit > 0 && n > limit) { throw new Exception("HTTP response exceeds byte limit") }
                 return reader.readExact(n)
             }
             // No length advertised — drain to EOF, relying on the
             // `Connection: close` we always send.
-            return reader.readToEnd()
+            return reader.readToEnd(limit)
         }
 
-        private static fun readChunkedBody(reader: StreamReader): UByte[] {
+        private static fun readChunkedBody(reader: StreamReader, limit: Int): UByte[] {
             // Block-append each decoded chunk into a doubling buffer
             // rather than the old per-byte List<UByte>.add — the latter
             // boxed one element per body byte, which pinned the CPU +
             // heap on a large download (see ByteAccumulator).
             var collected = new ByteAccumulator()
+            var total = 0
             loop {
                 var sizeLine = reader.readLine()
                 if (sizeLine == null) {
@@ -300,6 +304,8 @@ namespace Am.Web.Client {
                     }
                     break
                 }
+                if (size < 0 || (limit > 0 && size > limit - total)) { throw new Exception("HTTP response exceeds byte limit") }
+                total = total + size
                 var chunk = reader.readExact(size)
                 collected.append(chunk, chunk.length().toInt())
                 // Trailing CRLF after the chunk bytes.

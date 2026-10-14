@@ -129,8 +129,10 @@ namespace Am.Web.Client
         // thousands of tiny ARC allocations that pinned the CPU (and
         // churned memory) on Amiga. The block-copy path touches each
         // byte a couple of times with zero per-byte allocation.
-        fun readToEnd(): UByte[] {
+        fun readToEnd(): UByte[] { return this.readToEnd(0) }
+        fun readToEnd(limit: Int): UByte[] {
             var acc = new ByteAccumulator()
+            var total = 0
             var chunk = new UByte[8192]
             var reading = true
             while (reading) {
@@ -138,6 +140,8 @@ namespace Am.Web.Client
                 if (n <= 0) {
                     reading = false
                 } else {
+                    if (limit > 0 && n > limit - total) { throw new Exception("HTTP response exceeds byte limit") }
+                    total = total + n
                     acc.append(chunk, n)
                 }
             }
