@@ -54,8 +54,16 @@ platforms:
     additionalAsmSources:
     additionalCSources: 
     additionalIncludePaths:
+      # Resolved by make at build time, so this works on Apple Silicon
+      # (/opt/homebrew) and Intel (/usr/local) alike rather than hardcoding
+      # one machine's layout.
+      - $(shell brew --prefix openssl)/include
     gccAdditionalOptions:
+    gccLibraryPaths:
+      - $(shell brew --prefix openssl)/lib
     gccAdditionalLibraries:
+      - ssl
+      - crypto
   - id: linux-x64
     extends: libc
     gccCommand: gcc -O3

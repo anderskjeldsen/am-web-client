@@ -1,0 +1,69 @@
+namespace Am.Web.Client.Experimental {
+    // Caller-local handle over the shared Mac reactor manager. Callbacks stay
+    // on their creating isolate; each connection stays on its assigned worker.
+    #implementationPlatforms "libc", "macos-arm"
+    native class HttpReactor() {
+        import Am.Lang
+        import Am.IO
+        import Am.Collections
+        import Am.Web.Client
+        // Shared native configuration, not isolate-local static storage.
+        native static fun setMaxThreads(maximum: Int)
+        native static fun getMaxThreads(): Int
+        native static fun workerCount(): Int
+        private var callbacks: List<ReactorCallback> = new List<ReactorCallback>()
+        var maxResponseBytes: Int = 2097152
+        private native fun setLimitNative(limit: Int)
+        var timeoutMilliseconds: Int = 10000
+        fun submit(url: String): Int {
+            if (!url.startsWith("http://") && !url.startsWith("https://")) { throw new Exception("Expected HTTP(S) URL") }
+            this.setLimitNative(this.maxResponseBytes)
+            var parser = new UrlParser()
+            return this.submitNative(parser.extractHost(url), parser.extractPort(url), parser.extractPath(url), parser.isHttps(url), this.timeoutMilliseconds)
+        }
+        private native fun submitNative(host: String, port: Int, path: String, tls: Bool, timeout: Int): Int
+        native fun ready(id: Int): Int
+        // Wait for any terminal request without consuming messages/callbacks.
+        native fun waitAny(timeoutMilliseconds: Int): Int
+        native fun takeRaw(id: Int): UByte[]
+        native fun cancel(id: Int)
+        private native fun closeNative()
+        fun close() { this.closeNative()
+            this.callbacks = new List<ReactorCallback>() }
+        fun get(url: String): HttpResponse {
+            return this.take(this.submit(url))
+        }
+        fun take(id: Int): HttpResponse {
+            var raw = this.takeRaw(id)
+            var stream = new ResponseByteStream(raw)
+            var reader = new StreamReader(stream as Stream)
+            return WebClient.readResponse(reader, this.maxResponseBytes)
+        }
+        fun getAsync(url: String, callback: (ReactorResult) => Bool): Int {
+            var id = this.submit(url)
+            this.callbacks.add(new ReactorCallback(id, callback))
+            return id
+        }
+        // Explicit pump: lambdas stay on the caller and never run inline at
+        // submission or while a synchronous take waits on its own condition.
+        fun pump() {
+            var index = 0
+            while (index < this.callbacks.getSize()) {
+                var entry = this.callbacks.get(index)
+                if (this.ready(entry.id) == 0) { index++ }
+                else {
+                    this.callbacks.removeAt(index)
+                    var result = new ReactorResult(entry.id)
+                    try { result.response = this.take(entry.id) }
+                    catch (e: Exception) { result.error = e.message }
+                    entry.callback(result)
+                }
+            }
+        }
+    }
+    class ReactorCallback(var id: Am.Lang.Int, var callback: (ReactorResult) => Am.Lang.Bool) { }
+    class ReactorResult(var id: Am.Lang.Int) {
+        var response: Am.Web.Client.HttpResponse? = null
+        var error: Am.Lang.String = ""
+    }
+}

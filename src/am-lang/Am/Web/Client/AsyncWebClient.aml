@@ -1,32 +1,8 @@
 namespace Am.Web.Client {
 
-    // Suspend-friendly façade over WebClient. Each method schedules the
-    // full sync HTTP exchange (connect + write + read + close) onto the
-    // TaskScheduler IO worker, suspends the caller, then resumes the
-    // caller on the **main thread** by funnelling cont.resume() through
-    // TaskScheduler.schedule(TaskThreadType.Main, ...). The application
-    // is therefore expected to drain Main tasks from its main thread via
-    // `TaskScheduler.handleMainTasks()` from an event loop — if it
-    // doesn't, the suspend chain stalls forever after the IO call
-    // completes (the resume task sits in the Main queue, unpicked).
-    //
-    // Why "wrap sync WebClient on an IO worker" rather than a from-the-
-    // ground-up async HTTP stack: AsyncSocketStream now has full
-    // suspend send/receive/close, but real non-blocking HTTP would
-    // still want TaskScheduler primitives that don't
-    // exist yet (Condition variables, non-blocking socket polling). The
-    // worker-thread approach already keeps the main thread free, which
-    // is the whole point of "handle events on main thread"; full
-    // non-blocking I/O is a future refinement.
-    //
-    // The class is intentionally instance-based even though it holds no
-    // per-request state — it mirrors the sync WebClient's shape so call
-    // sites stay symmetric (`new AsyncWebClient().getAsync(url)` vs
-    // `new WebClient().get(url)`). The suspend codegen fixes that
-    // landed alongside this class (receiver slot in the child state,
-    // and `var_this` mangling in suspend bodies) made the instance
-    // form safe — earlier drafts had to be all `static suspend` to
-    // dodge those bugs.
+    // Callback overloads use the shared nonblocking HttpReactor manager.
+    // The older one-argument suspend methods below remain legacy IO wrappers;
+    // callers wanting the reactor use getAsync(url, callback) and pump().
     class AsyncWebClient {
         import Am.Lang
         import Am.IO
@@ -34,7 +10,23 @@ namespace Am.Web.Client {
         import Am.Net.Ssl
         import Am.Threading
         import Am.Async
+        import Am.Web.Client.Experimental
         import Am.Collections
+
+        // Controls the nonblocking HttpReactor manager used by Tucanium.
+        // Native shared storage: visible from every calling isolate.
+        static fun setMaxThreads(maximum: Int) { HttpReactor.setMaxThreads(maximum) }
+        static fun getMaxThreads(): Int { return HttpReactor.getMaxThreads() }
+
+        private var reactor: HttpReactor? = null
+        fun getAsync(url: String, callback: (ReactorResult) => Bool): Int {
+            if (this.reactor == null) { this.reactor = new HttpReactor() }
+            return (this.reactor as HttpReactor).getAsync(url, callback)
+        }
+        fun pump() { if (this.reactor != null) { (this.reactor as HttpReactor).pump() } }
+        fun cancel(id: Int) { if (this.reactor != null) { (this.reactor as HttpReactor).cancel(id) } }
+        fun close() { if (this.reactor != null) { (this.reactor as HttpReactor).close()
+            this.reactor = null } }
 
         // ---- String-based API -------------------------------------------
 

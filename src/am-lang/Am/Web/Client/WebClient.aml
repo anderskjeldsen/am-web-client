@@ -205,7 +205,7 @@ namespace Am.Web.Client {
 
         // ---- Response reading ------------------------------------------
 
-        private static fun readResponse(reader: StreamReader, limit: Int): HttpResponse {
+        static fun readResponse(reader: StreamReader, limit: Int): HttpResponse {
             var statusLine = reader.readLine()
             if (statusLine == null) {
                 var emptyHeaders = new HashMap<String, String>()

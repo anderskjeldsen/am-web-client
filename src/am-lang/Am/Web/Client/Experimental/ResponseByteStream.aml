@@ -1,0 +1,26 @@
+namespace Am.Web.Client.Experimental {
+    // Wrap the raw response without boxing each byte into a List.
+    class ResponseByteStream(private var data: UByte[]) : Stream {
+        import Am.Lang
+        import Am.IO
+        private var position: UInt = 0UI
+        fun read(buffer: UByte[], offset: Long, length: UInt): UInt {
+            var count = UInt.min(length, this.data.length() - this.position)
+            this.data.copyTo(buffer, offset.toUInt(), this.position, count)
+            this.position += count
+            return count
+        }
+        fun readByte(): Int {
+            if (this.position >= this.data.length()) { return -1 }
+            var result = this.data[this.position].toInt()
+            this.position++
+            return result
+        }
+        fun seekFromStart(offset: Long) {
+            if (offset < 0L || offset > this.data.length().toLong()) { throw new Exception("Invalid response stream offset") }
+            this.position = offset.toUInt()
+        }
+        fun write(buffer: UByte[], offset: Long, length: UInt) { throw new Exception("Read-only response stream") }
+        fun writeByte(byte: Int) { throw new Exception("Read-only response stream") }
+    }
+}
