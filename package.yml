@@ -2,6 +2,14 @@ id: am-web-client
 version: 0.10.0
 type: application
 dependencies:
+  # Test-only, so `build` skips it: the suite under tests/ needs Assert.
+  - id: am-tests
+    testOnly: true
+    realm: github
+    type: git-repo
+    tag: latest
+    url: https://github.com/anderskjeldsen/am-tests.git
+    features: ["floatingPoint"]
   - id: am-lang-core
     realm: github
     type: git-repo

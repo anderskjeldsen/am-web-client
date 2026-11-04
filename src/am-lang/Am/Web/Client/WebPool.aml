@@ -1,0 +1,685 @@
+namespace Am.Web.Client
+{
+    // One unit of work handed to a pool worker. Plain values only: it is
+    // deep-copied across the isolate boundary, so anything live (a window, a
+    // continuation, a callback) must stay behind on the calling thread.
+    class WebPoolJob(var ticket: Int, var method: String, var url: String,
+                     var body: String, var wantBytes: Bool) {
+        import Am.Lang
+        import Am.Collections
+
+        var headers: HashMap<String, String> = new HashMap<String, String>()
+        // 0 leaves WebClient's own default alone.
+        var timeoutSeconds: Int = 0
+        // Non-empty makes this a download: the body is written here on the
+        // worker's thread and never crosses back as bytes.
+        var savePath: String = ""
+    }
+
+    // Tells a worker to leave its receive loop.
+    class WebPoolStop() {
+        import Am.Lang
+    }
+
+    // What a worker sends back.
+    //
+    // `slot` is how the pool knows which worker freed up. `poolId` is how it
+    // knows the answer is even ITS: two pools on one thread share that
+    // thread's single mailbox, so without it pool A's pump() consumes pool
+    // B's answer -- and for a pool-owned (negative) ticket A finds nothing in
+    // its own pending map and swallows it, leaving B's caller suspended for
+    // good.
+    class WebPoolAnswer(var ticket: Int, var slot: Int, var poolId: Int) {
+        import Am.Lang
+
+        var answer: AsyncHttpAnswer? = null
+        var savedBytes: Int = 0
+    }
+
+    // A pool worker.
+    //
+    // It holds its OWN reactor, so one worker carries up to `capacity`
+    // requests at once rather than one: the sockets inside a worker are
+    // non-blocking and share a single select(), exactly as they do on a
+    // caller's thread. N workers x M connections concurrent requests on N
+    // threads instead of N.
+    //
+    // Why a worker at all, then, if the reactor needs no threads? Three
+    // things stay on this side of the boundary: DNS, which SocketPoll
+    // resolves synchronously and would otherwise stall the caller; TLS
+    // crypto, which is the expensive part and gets a core of its own here;
+    // and the select() wait itself, so the caller's loop never blocks.
+    //
+    // `capacity` 1 restores the old behaviour -- one blocking WebClient call
+    // per worker -- which is the fallback for a platform without SocketPoll,
+    // and the only path that supports savePath downloads and chunked
+    // HTTP/1.1, since those live in WebClient.
+    class WebPoolWorker(private var slot: Int, private var capacity: Int,
+                        private var poolId: Int) : Runnable {
+        import Am.Lang
+        import Am.Collections
+        import Am.Threading
+        import Am.IO
+        import Am.Web.Client.Experimental
+
+        override fun run() {
+            if (this.capacity <= 1) { this.runOneAtATime()
+                return }
+            this.runMultiplexed()
+        }
+
+        // One blocking WebClient call at a time. Simple, and the only path
+        // that can write a download straight to disk.
+        private fun runOneAtATime() {
+            var parent = Thread.getParent()
+            var running = true
+            while (running) {
+                var message = Thread.receive()
+                if (message is WebPoolStop) { running = false }
+                else {
+                    if (message is WebPoolJob) {
+                        var job = message as WebPoolJob
+                        var reply = new WebPoolAnswer(job.ticket, this.slot, this.poolId)
+                        reply.answer = WebPoolWorker.fetch(job)
+                        parent.send(reply)
+                    }
+                }
+            }
+        }
+
+        // Up to `capacity` requests in flight on one reactor.
+        private fun runMultiplexed() {
+            var parent = Thread.getParent()
+            var reactor = new HttpReactor()
+            var ids = new List<Int>()
+            var tickets = new List<Int>()
+            var running = true
+
+            while (running) {
+                // Take work. Block only when there is nothing in flight --
+                // otherwise a blocking receive would stop us advancing the
+                // connections we already have.
+                var idle = ids.getSize() == 0
+                var message: Object? = null
+                if (idle) { message = Thread.receive() }
+                else { message = Thread.tryReceive() }
+
+                var accepting = true
+                while (accepting) {
+                    if (message == null) { accepting = false }
+                    else {
+                        if (message is WebPoolStop) { running = false
+                            accepting = false }
+                        else {
+                            if (message is WebPoolJob) {
+                                var job = message as WebPoolJob
+                                if (job.savePath.length() > 0) {
+                                    // The reactor has no download path -- it
+                                    // accumulates in memory. Rather than
+                                    // silently writing nothing, serve this one
+                                    // the blocking way. It stalls this
+                                    // worker's other connections for the
+                                    // duration, which is the honest cost of
+                                    // mixing the two modes.
+                                    var dl = new WebPoolAnswer(job.ticket, this.slot, this.poolId)
+                                    dl.answer = WebPoolWorker.fetch(job)
+                                    parent.send(dl)
+                                } else {
+                                    if (job.timeoutSeconds > 0) {
+                                        reactor.timeoutMilliseconds = job.timeoutSeconds * 1000
+                                    }
+                                    var failure = ""
+                                    var id = 0
+                                    try {
+                                        id = reactor.submitRequest(job.method, job.url,
+                                            job.body, job.headers)
+                                    } catch (e: Exception) {
+                                        failure = e.message
+                                    }
+                                    if (failure.length() > 0) {
+                                        var bad = new WebPoolAnswer(job.ticket, this.slot, this.poolId)
+                                        bad.answer = new AsyncHttpAnswer(0, "", "", failure)
+                                        parent.send(bad)
+                                    } else {
+                                        ids.add(id)
+                                        tickets.add(job.ticket)
+                                    }
+                                }
+                            }
+                            if (ids.getSize() >= this.capacity) { accepting = false }
+                            else { message = Thread.tryReceive() }
+                        }
+                    }
+                }
+
+                if (ids.getSize() > 0) {
+                    // 50ms rather than a long wait: this thread also has to
+                    // notice new jobs arriving in its mailbox.
+                    reactor.advance(50)
+                    var i = 0
+                    while (i < ids.getSize()) {
+                        var id = ids.get(i)
+                        if (reactor.ready(id) == 1) {
+                            var reply = new WebPoolAnswer(tickets.get(i), this.slot, this.poolId)
+                            reply.answer = WebPoolWorker.collect(reactor, id)
+                            parent.send(reply)
+                            ids.removeAt(i)
+                            tickets.removeAt(i)
+                        } else { i = i + 1 }
+                    }
+                }
+            }
+            reactor.close()
+        }
+
+        // The reactor's answer in the pool's shape.
+        private static fun collect(reactor: HttpReactor, id: Int): AsyncHttpAnswer {
+            var answer = new AsyncHttpAnswer(0, "", "", "")
+            try {
+                var r = reactor.take(id)
+                answer.status = r.getStatusCode()
+                answer.statusMessage = r.getStatusMessage()
+                var text = r.getBodyAsString()
+                if (text != null) { answer.body = text }
+                answer.bodyBytes = r.getBodyAsBytes()
+            } catch (e: Exception) {
+                var m = e.message
+                if (m == null || m.length() == 0) { m = "The request failed." }
+                answer.error = m
+            }
+            return answer
+        }
+
+        // The blocking request itself. Shaped like AsyncTransport.blocking,
+        // but with the timeout and the download path WebClient alone offers.
+        static fun fetch(job: WebPoolJob): AsyncHttpAnswer {
+            var answer = new AsyncHttpAnswer(0, "", "", "")
+            try {
+                var client = new WebClient()
+                if (job.timeoutSeconds > 0) { client.timeoutSeconds = job.timeoutSeconds }
+                var response: HttpResponse? = null
+                if (job.method.equals("POST")) {
+                    response = client.postWithHeaders(job.url, job.body, job.headers)
+                } else {
+                    if (job.wantBytes || job.savePath.length() > 0) {
+                        response = client.getBytesWithHeaders(job.url, job.headers)
+                    } else {
+                        response = client.getWithHeaders(job.url, job.headers)
+                    }
+                }
+                if (response == null) {
+                    answer.error = "No response from " + job.url
+                    return answer
+                }
+                var r = response as HttpResponse
+                answer.status = r.getStatusCode()
+                answer.statusMessage = r.getStatusMessage()
+                if (job.savePath.length() > 0) {
+                    // Written here, on the worker, so a large download never
+                    // crosses the isolate boundary as a byte array.
+                    var bytes = r.getBodyAsBytes()
+                    var file = new File(job.savePath)
+                    var stream = new FileStream(file, FileAccess.writeOnly)
+                    stream.write(bytes, 0L, bytes.length())
+                    stream.close()
+                } else {
+                    if (job.wantBytes) { answer.bodyBytes = r.getBodyAsBytes() }
+                    else {
+                        var text = r.getBodyAsString()
+                        if (text != null) { answer.body = text }
+                    }
+                }
+            } catch (e: Exception) {
+                var m = e.message
+                if (m == null || m.length() == 0) { m = "The request could not be sent." }
+                answer.error = m
+            }
+            return answer
+        }
+    }
+
+    /**
+     * A bounded pool of worker isolates for HTTP, with the answer arriving on
+     * the thread that asked.
+     *
+     * The problem it solves: `AsyncTransport` suspends the caller and hands
+     * the request to a host-supplied hook, but every application had to build
+     * that hook itself -- and the usual home-made version is ONE worker, so
+     * two concurrent requests queue behind each other. This is the hook, with
+     * a configurable number of workers.
+     *
+     * How the answer gets home: a worker cannot resume a continuation that
+     * lives in another isolate, so it sends a plain `WebPoolAnswer` back and
+     * `pump()` -- called on the SAME thread that made the request -- turns it
+     * into `AsyncTransport.deliver`, which resumes the caller there. That is
+     * the whole reason pump() exists and why it must not be called from
+     * anywhere else.
+     *
+     * Against `Experimental.HttpReactor`: the reactor does everything on one
+     * thread with no workers at all, which is the right answer when threads
+     * are expensive or unavailable, but it speaks only plain GET. This speaks
+     * everything `WebClient` does -- POST, headers, timeouts, downloads --
+     * at the cost of one isolate per concurrent request.
+     *
+     * AMIGAOS: workers here are user-spawned Threads, and AmiSSL keeps
+     * per-task state -- a 2026-05-28 observation on FS-UAE had `InitAmiSSL`
+     * hanging on exactly that kind of thread. Re-tested 2026-10-15 under
+     * amiberry with bsdsocket_emu + AmiSSL v362 after am-ssl grew its
+     * per-task bring-up: three concurrent HTTPS GETs through a pool of three
+     * all completed. So the hang does not reproduce there -- but it has NOT
+     * been re-tested on FS-UAE or real hardware, and the original cause was
+     * never diagnosed. Treat Amiga TLS through the pool as working but
+     * watched; `Experimental.HttpReactor` needs no worker tasks at all and
+     * stays the safer choice if it ever comes back.
+     */
+    class WebPool(var maxWorkers: Int) {
+        import Am.Lang
+        import Am.Collections
+        import Am.Threading
+        import Am.Async
+
+        // Workers are started lazily and then reused: an AmLang thread costs
+        // a 4 MB stack on AmigaOS, so one per request would be ruinous there
+        // and merely wasteful everywhere else.
+        private var workers: List<Thread> = new List<Thread>()
+        private var slotBusy: List<Int> = new List<Int>()
+        private var queue: List<WebPoolJob> = new List<WebPoolJob>()
+        private var inFlight: Int = 0
+
+        // Callers that hold this pool and await it directly (postAsync and
+        // friends below) keep their continuations HERE, not in
+        // AsyncTransport. Their tickets are NEGATIVE so the two ticket
+        // spaces cannot collide: a positive ticket on an answer came from
+        // the AsyncTransport hook and belongs to AsyncTransport.deliver, a
+        // negative one is ours to resume.
+        private var pending: HashMap<Int, Continuation> = new HashMap<Int, Continuation>()
+        private var answers: HashMap<Int, AsyncHttpAnswer> = new HashMap<Int, AsyncHttpAnswer>()
+        private var nextOwnTicket: Int = -1
+
+        /** Applied to jobs that do not set their own. 0 leaves WebClient's default. */
+        var timeoutSeconds: Int = 0
+
+        /**
+         * How many requests ONE worker carries at once, multiplexed over a
+         * single select() inside it. The pool's real ceiling is therefore
+         * maxWorkers * connectionsPerWorker.
+         *
+         * 1 means a worker does one blocking WebClient call at a time -- the
+         * only mode that supports savePath downloads and chunked HTTP/1.1,
+         * and the only one that works without Am.Net.SocketPoll. Raise it and
+         * a worker becomes a reactor: cheap concurrency, GET/POST with
+         * headers, body ends at EOF.
+         *
+         * Changing it after the first worker has started affects only workers
+         * started later.
+         */
+        var connectionsPerWorker: Int = 1
+
+        // ---- the shared instance, which is what the dispatch hook uses ----
+        //
+        // A static, because the hook must not capture anything: a lambda
+        // captures by value, and AsyncTransport's own notes record what that
+        // did to an earlier design. The hook calls one static with one
+        // argument and nothing else.
+        private static var shared: WebPool? = null
+
+        // Distinct per pool in this isolate, so answers can be told apart.
+        private static var nextPoolId: Int = 1
+        private var poolId: Int = 0
+
+        private fun id(): Int {
+            if (this.poolId == 0) {
+                this.poolId = WebPool.nextPoolId
+                WebPool.nextPoolId = WebPool.nextPoolId + 1
+            }
+            return this.poolId
+        }
+
+        /**
+         * How many worker isolates this isolate's pool may start. Default 4.
+         * Lowering it below the number already started does not stop them;
+         * they simply stop being handed work.
+         */
+        static fun setMaxWorkers(maximum: Int) {
+            WebPool.ensure().maxWorkers = maximum
+        }
+
+        static fun getMaxWorkers(): Int { return WebPool.ensure().maxWorkers }
+
+        /**
+         * How many requests ONE worker carries at once. Default 1. Above 1 a
+         * worker becomes a reactor -- cheap concurrency, but GET/POST only and
+         * NOT usable on AmigaOS yet (see the note on the field).
+         */
+        static fun setConnectionsPerWorker(count: Int) {
+            WebPool.ensure().connectionsPerWorker = count
+        }
+
+        static fun getConnectionsPerWorker(): Int {
+            return WebPool.ensure().connectionsPerWorker
+        }
+
+        /** Requests in flight right now, across this isolate's pool. */
+        static fun activeRequests(): Int { return WebPool.ensure().activeCount() }
+
+        /** Requests waiting for a free worker. */
+        static fun queuedRequests(): Int { return WebPool.ensure().queuedCount() }
+
+        /** Worker isolates actually started. */
+        static fun workers(): Int { return WebPool.ensure().workerCount() }
+
+        // This isolate's pool, made on demand. Statics are per isolate, so
+        // Main has its own and a worker that calls these gets its own -- the
+        // scope is the thread, which is the same scope pump() has to run on.
+        private static fun ensure(): WebPool {
+            var pool = WebPool.shared
+            if (pool == null) {
+                pool = new WebPool(4)
+                WebPool.shared = pool
+            }
+            return pool as WebPool
+        }
+
+        // ---- the static front door --------------------------------------
+        //
+        // What most callers want: no instance to pass around, one pool per
+        // thread, pump() in the main loop. The instance API underneath is for
+        // the cases this cannot express -- two pools with different limits,
+        // or one whose lifetime you want to control.
+
+        /** POST through this isolate's pool. */
+        static suspend fun post(url: String, body: String,
+                                headers: HashMap<String, String>): AsyncHttpAnswer {
+            return WebPool.ensure().postAsync(url, body, headers)
+        }
+
+        /** GET through this isolate's pool. */
+        static suspend fun get(url: String, headers: HashMap<String, String>): AsyncHttpAnswer {
+            return WebPool.ensure().getAsync(url, headers)
+        }
+
+        /** GET with the body as bytes in `bodyBytes`. */
+        static suspend fun getBytes(url: String, headers: HashMap<String, String>): AsyncHttpAnswer {
+            return WebPool.ensure().getBytesAsync(url, headers)
+        }
+
+        /** GET written to `path` on the worker. */
+        static suspend fun download(url: String, path: String,
+                                    headers: HashMap<String, String>): AsyncHttpAnswer {
+            return WebPool.ensure().downloadAsync(url, path, headers)
+        }
+
+        /** Drains answers and resumes their callers. Main loop, same thread. */
+        static fun pump(): Int {
+            var pool = WebPool.shared
+            if (pool == null) { return 0 }
+            return (pool as WebPool).drain()
+        }
+
+        /** Stops this isolate's pool. */
+        static fun shutdown() {
+            var pool = WebPool.shared
+            if (pool == null) { return }
+            (pool as WebPool).close()
+            WebPool.shared = null
+        }
+
+        /**
+         * Also points `AsyncTransport` at this isolate's pool, so library code
+         * that cannot be handed one -- am-ide's chatgpt and aminet modules
+         * call `AsyncTransport.request` from deep inside -- goes through it
+         * too. The statics above work without this.
+         */
+        static fun install(maxWorkers: Int): WebPool {
+            var pool = new WebPool(maxWorkers)
+            WebPool.shared = pool
+            AsyncTransport.dispatch = (req) => {
+                WebPool.submitShared(req)
+                return true
+            }
+            return pool
+        }
+
+        static fun getShared(): WebPool? { return WebPool.shared }
+
+        static fun submitShared(request: AsyncHttpRequest) {
+            var pool = WebPool.shared
+            if (pool == null) {
+                // No pool: answer immediately rather than leaving the caller
+                // suspended forever.
+                AsyncTransport.deliver(request.ticket,
+                    new AsyncHttpAnswer(0, "", "", "no WebPool is installed"))
+                return
+            }
+            (pool as WebPool).submit(request)
+        }
+
+        // ---- instance API -------------------------------------------------
+
+        // ---- the explicit surface: you hold the pool, you ask it --------
+        //
+        // No statics and no hook involved. `pool.postAsync(...)` reads as what
+        // it is: this pool runs the request on one of its workers and resumes
+        // you here. install() stays available for library code that cannot be
+        // handed a pool, but nothing requires it.
+
+        /** POST, awaited. Never throws: a transport failure arrives in `error`. */
+        suspend fun postAsync(url: String, body: String,
+                              headers: HashMap<String, String>): AsyncHttpAnswer {
+            return this.requestAsync("POST", url, body, headers, false)
+        }
+
+        /** GET, awaited. */
+        suspend fun getAsync(url: String, headers: HashMap<String, String>): AsyncHttpAnswer {
+            return this.requestAsync("GET", url, "", headers, false)
+        }
+
+        /** GET whose body comes back as bytes in `bodyBytes`. */
+        suspend fun getBytesAsync(url: String, headers: HashMap<String, String>): AsyncHttpAnswer {
+            return this.requestAsync("GET", url, "", headers, true)
+        }
+
+        /**
+         * GET written straight to `path` on the worker's thread, so the bytes
+         * never cross back into this isolate.
+         */
+        suspend fun downloadAsync(url: String, path: String,
+                                  headers: HashMap<String, String>): AsyncHttpAnswer {
+            var ticket = this.nextOwnTicket
+            this.nextOwnTicket = this.nextOwnTicket - 1
+            var job = new WebPoolJob(ticket, "GET", url, "", false)
+            job.headers = headers
+            job.timeoutSeconds = this.timeoutSeconds
+            job.savePath = path
+            return this.await(ticket, job)
+        }
+
+        /** The one both of the above go through. `method` is "GET" or "POST". */
+        suspend fun requestAsync(method: String, url: String, body: String,
+                                 headers: HashMap<String, String>,
+                                 wantBytes: Bool): AsyncHttpAnswer {
+            var ticket = this.nextOwnTicket
+            this.nextOwnTicket = this.nextOwnTicket - 1
+            var job = new WebPoolJob(ticket, method, url, body, wantBytes)
+            job.headers = headers
+            job.timeoutSeconds = this.timeoutSeconds
+            return this.await(ticket, job)
+        }
+
+        private suspend fun await(ticket: Int, job: WebPoolJob): AsyncHttpAnswer {
+            suspend(cont) {
+                this.pending.set(ticket, cont)
+                this.queue.add(job)
+                this.start()
+            }
+            if (!this.answers.containsKey(ticket)) {
+                return new AsyncHttpAnswer(0, "", "", "the pool resumed without an answer")
+            }
+            var answer = this.answers.get(ticket)
+            this.answers.remove(ticket)
+            return answer
+        }
+
+        /** Queues a request. The answer reaches the caller through pump(). */
+        fun submit(request: AsyncHttpRequest) {
+            var job = new WebPoolJob(request.ticket, request.method, request.url,
+                request.body, request.wantBytes)
+            job.headers = request.headers
+            job.timeoutSeconds = this.timeoutSeconds
+            this.queue.add(job)
+            this.start()
+        }
+
+        /** Queues a job built directly, for callers not going through AsyncTransport. */
+        fun submitJob(job: WebPoolJob) {
+            if (job.timeoutSeconds == 0) { job.timeoutSeconds = this.timeoutSeconds }
+            this.queue.add(job)
+            this.start()
+        }
+
+        /** How many requests are being worked on right now. */
+        fun activeCount(): Int { return this.inFlight }
+
+        /** How many are waiting for a free worker. */
+        fun queuedCount(): Int { return this.queue.getSize() }
+
+        /** How many worker isolates have actually been started. */
+        fun workerCount(): Int { return this.workers.getSize() }
+
+        // Hand queued jobs to workers with room, starting new ones up to the
+        // limit. slotBusy counts a worker's in-flight requests rather than
+        // holding a flag, because a multiplexing worker has room for more
+        // than one.
+        private fun start() {
+            while (this.queue.getSize() > 0) {
+                var slot = this.freeSlot()
+                if (slot < 0) { return }
+                var job = this.queue.get(0)
+                this.queue.removeAt(0)
+                this.slotBusy.set(slot, this.slotBusy.get(slot) + 1)
+                this.inFlight = this.inFlight + 1
+                this.workers.get(slot).send(job)
+            }
+        }
+
+        // The index of a worker with spare capacity, starting one if we are
+        // under the worker limit. Least-loaded first, so work spreads instead
+        // of piling onto worker 0.
+        private fun freeSlot(): Int {
+            var best = -1
+            var bestLoad = this.connectionsPerWorker
+            var i = 0
+            while (i < this.slotBusy.getSize()) {
+                var load = this.slotBusy.get(i)
+                if (load < bestLoad) { best = i
+                    bestLoad = load }
+                i = i + 1
+            }
+            if (best >= 0) { return best }
+            if (this.workers.getSize() >= this.maxWorkers) { return -1 }
+            var slot = this.workers.getSize()
+            var thread = new Thread(new WebPoolWorker(slot, this.connectionsPerWorker,
+                this.id()) as Runnable)
+            thread.name = "webpool-" + slot.toString()
+            thread.start()
+            this.workers.add(thread)
+            this.slotBusy.add(0)
+            return slot
+        }
+
+        /**
+         * Hands one message to the pool. Returns true when it was an answer
+         * this pool was waiting for. For hosts that already drain the mailbox
+         * themselves -- they pass what they do not recognise here instead of
+         * putting it back. am-ide's MainBus is the case this serves.
+         */
+        fun offer(message: Object): Bool {
+            if (!(message is WebPoolAnswer)) { return false }
+            var reply = message as WebPoolAnswer
+            // Another pool's answer. Saying false hands it back to the caller
+            // to pass on or re-send, so the pool that is waiting for it gets
+            // it on a later pass.
+            if (reply.poolId != this.poolId) { return false }
+            if (reply.slot >= 0 && reply.slot < this.slotBusy.getSize()) {
+                var load = this.slotBusy.get(reply.slot) - 1
+                if (load < 0) { load = 0 }
+                this.slotBusy.set(reply.slot, load)
+            }
+            this.inFlight = this.inFlight - 1
+            var answer = reply.answer
+            if (answer == null) {
+                answer = new AsyncHttpAnswer(0, "", "", "the worker returned no answer")
+            }
+            if (reply.ticket < 0) {
+                // Ours: resume the caller that is holding this pool.
+                this.answers.set(reply.ticket, answer as AsyncHttpAnswer)
+                if (this.pending.containsKey(reply.ticket)) {
+                    var cont = this.pending.get(reply.ticket)
+                    this.pending.remove(reply.ticket)
+                    this.start()
+                    cont.resume()
+                    return true
+                }
+            } else {
+                AsyncTransport.deliver(reply.ticket, answer as AsyncHttpAnswer)
+            }
+            this.start()
+            return true
+        }
+
+        /**
+         * Drains this thread's mailbox, resumes whoever was waiting, and sets
+         * the freed workers going again.
+         *
+         * Messages that are not ours are put back AFTER the drain, never
+         * during it -- re-sending inside the loop would hand them straight
+         * back to this same pass. That is the same contract a host bus
+         * follows, so the two can share one mailbox.
+         *
+         * Named apart from the static `pump()` because amlc rejects a static
+         * and an instance function with the same name and arity in one class.
+         *
+         * @return how many answers were delivered
+         */
+        fun drain(): Int {
+            var delivered = 0
+            var others = new List<Object>()
+            var draining = true
+            while (draining) {
+                var m = Thread.tryReceive()
+                if (m == null) { draining = false }
+                else {
+                    if (m is WebPoolAnswer) {
+                        if (this.offer(m)) { delivered = delivered + 1 }
+                        else { others.add(m) }     // a sibling pool's
+                    } else { others.add(m) }
+                }
+            }
+            var i = 0
+            while (i < others.getSize()) {
+                Thread.getCurrent().send(others.get(i))
+                i = i + 1
+            }
+            this.start()
+            return delivered
+        }
+
+        /** Stops every worker. Queued jobs are dropped. */
+        fun close() {
+            var i = 0
+            while (i < this.workers.getSize()) {
+                this.workers.get(i).send(new WebPoolStop())
+                i = i + 1
+            }
+            var j = 0
+            while (j < this.workers.getSize()) {
+                this.workers.get(j).join()
+                j = j + 1
+            }
+            this.workers = new List<Thread>()
+            this.slotBusy = new List<Int>()
+            this.queue = new List<WebPoolJob>()
+            this.inFlight = 0
+        }
+    }
+}

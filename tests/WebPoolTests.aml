@@ -1,0 +1,346 @@
+namespace Tests {
+
+    // A canned HTTP/1.1 server on loopback, so the suite needs nothing
+    // outside the process -- no python helper, no internet. It answers
+    // `count` requests and then stops.
+    //
+    // Why its own thread: accept() blocks. It replies with an explicit
+    // Content-Length (not EOF-delimited), which is what WebClient's parser
+    // on the pool's worker expects.
+    class WpServer(private var port: Int, private var count: Int) : Runnable {
+        import Am.Lang
+        import Am.Net
+        import Am.Threading
+
+        override fun run() {
+            var listener = Socket.create(AddressFamily.inet, SocketType.stream,
+                ProtocolFamily.unspecified)
+            listener.bind(this.port)
+            listener.listen(8)
+            // Tell the parent the port is open, so a test never races the bind.
+            Thread.getParent().send(new WpReady())
+
+            var served = 0
+            while (served < this.count) {
+                var client = listener.accept()
+                // One read is enough: the request fits in a packet and we do
+                // not care what it says, only that it arrived.
+                var request = new UByte[4096UI]
+                client.receive(request, 0L, 4096UI)
+
+                var body = "pool-ok"
+                var text = "HTTP/1.1 200 OK\r\nContent-Length: " +
+                    body.length().toString() +
+                    "\r\nContent-Type: text/plain\r\nConnection: close\r\n\r\n" + body
+                var bytes = text.toBytes("UTF-8")
+                client.send(bytes, 0L, bytes.length())
+                client.close()
+                served = served + 1
+            }
+            listener.close()
+        }
+    }
+
+    class WpReady() {
+        import Am.Lang
+    }
+
+    class WebPoolTests {
+        import Am.Lang
+        import Am.Collections
+        import Am.IO
+        import Am.Threading
+        import Am.Net
+        import Am.Web.Client
+        import Am.Tests
+
+        // Each test gets its own port: a closed listener can linger in
+        // TIME_WAIT and a shared port makes the suite order-dependent.
+        private static var nextPort: Int = 18420
+
+        private static var answers: List<AsyncHttpAnswer> = new List<AsyncHttpAnswer>()
+        private static var resumedOn: List<String> = new List<String>()
+
+        private static fun reset() {
+            WebPoolTests.answers = new List<AsyncHttpAnswer>()
+            WebPoolTests.resumedOn = new List<String>()
+        }
+
+        private static fun takePort(): Int {
+            var port = WebPoolTests.nextPort
+            WebPoolTests.nextPort = WebPoolTests.nextPort + 1
+            return port
+        }
+
+        // Starts the server and waits for its ready message, so no test has
+        // to sleep and hope.
+        private static fun startServer(port: Int, count: Int): Thread {
+            var t = new Thread(new WpServer(port, count) as Runnable)
+            t.name = "wp-server"
+            t.start()
+            var m = Thread.receive()
+            Assert.assertTrue(m is WpReady)
+            return t
+        }
+
+        private static fun url(port: Int): String {
+            return "http://127.0.0.1:" + port.toString() + "/test"
+        }
+
+        // Fire-and-forget from a non-suspend body: this returns at the first
+        // suspension point and the test then pumps until the answer lands.
+        private static suspend fun fire(pool: WebPool, target: String) {
+            var answer = pool.postAsync(target, "hello", new HashMap<String, String>())
+            WebPoolTests.answers.add(answer)
+            WebPoolTests.resumedOn.add(Thread.getCurrent().name)
+        }
+
+        private static suspend fun download(pool: WebPool, target: String, path: String) {
+            var answer = pool.downloadAsync(target, path, new HashMap<String, String>())
+            WebPoolTests.answers.add(answer)
+            WebPoolTests.resumedOn.add(Thread.getCurrent().name)
+        }
+
+        private static suspend fun fireStatic(target: String) {
+            var answer = WebPool.post(target, "hello", new HashMap<String, String>())
+            WebPoolTests.answers.add(answer)
+            WebPoolTests.resumedOn.add(Thread.getCurrent().name)
+        }
+
+        // Pumps the instance until `expected` answers have arrived or the
+        // budget runs out. Returns how many arrived, so a test can assert on
+        // it rather than hanging.
+        private static fun drainUntil(pool: WebPool, expected: Int): Int {
+            var spins = 0
+            while (WebPoolTests.answers.getSize() < expected && spins < 1500) {
+                pool.drain()
+                Thread.sleep(10L)
+                spins = spins + 1
+            }
+            return WebPoolTests.answers.getSize()
+        }
+
+        private static fun drainStaticUntil(expected: Int): Int {
+            var spins = 0
+            while (WebPoolTests.answers.getSize() < expected && spins < 1500) {
+                WebPool.pump()
+                Thread.sleep(10L)
+                spins = spins + 1
+            }
+            return WebPoolTests.answers.getSize()
+        }
+
+        // ---- one request, end to end --------------------------------------
+
+        test testPostReachesServerAndComesBack() {
+            WebPoolTests.reset()
+            var port = WebPoolTests.takePort()
+            var server = WebPoolTests.startServer(port, 1)
+
+            var pool = new WebPool(2)
+            WebPoolTests.fire(pool, WebPoolTests.url(port))
+            Assert.assertEquals(1, WebPoolTests.drainUntil(pool, 1))
+
+            var answer = WebPoolTests.answers.get(0)
+            Assert.assertEquals("", answer.error)
+            Assert.assertEquals(200, answer.status)
+            Assert.assertEquals("pool-ok", answer.body)
+
+            pool.close()
+            server.join()
+        }
+
+        // ---- the answer is delivered on the thread that asked -------------
+
+        test testCallerIsResumedOnItsOwnThread() {
+            WebPoolTests.reset()
+            var port = WebPoolTests.takePort()
+            var server = WebPoolTests.startServer(port, 1)
+            Thread.getCurrent().name = "test-caller"
+
+            var pool = new WebPool(1)
+            WebPoolTests.fire(pool, WebPoolTests.url(port))
+            Assert.assertEquals(1, WebPoolTests.drainUntil(pool, 1))
+            // Not the worker's name: the continuation must resume here.
+            Assert.assertEquals("test-caller", WebPoolTests.resumedOn.get(0))
+
+            pool.close()
+            server.join()
+        }
+
+        // ---- maxWorkers is a real limit, not a hint -----------------------
+        //
+        // Asserted on the pool's own accounting rather than on elapsed time,
+        // so the test cannot go flaky on a slow machine.
+
+        test testWorkersAreCappedAndTheRestQueue() {
+            WebPoolTests.reset()
+            var port = WebPoolTests.takePort()
+            var server = WebPoolTests.startServer(port, 5)
+
+            var pool = new WebPool(2)
+            var i = 0
+            while (i < 5) {
+                WebPoolTests.fire(pool, WebPoolTests.url(port))
+                i = i + 1
+            }
+            // Two in flight, three waiting, and only two isolates started.
+            Assert.assertEquals(2, pool.activeCount())
+            Assert.assertEquals(3, pool.queuedCount())
+            Assert.assertEquals(2, pool.workerCount())
+
+            Assert.assertEquals(5, WebPoolTests.drainUntil(pool, 5))
+            // Everything drained, nothing stuck.
+            Assert.assertEquals(0, pool.activeCount())
+            Assert.assertEquals(0, pool.queuedCount())
+            // Still only two workers: the queue was reused, not grown.
+            Assert.assertEquals(2, pool.workerCount())
+
+            pool.close()
+            server.join()
+        }
+
+        // ---- two pools on one thread must not take each other's answers ---
+        //
+        // Regression: WebPoolAnswer carried no pool identity, so pool A's
+        // drain() consumed pool B's answer and -- for a pool-owned, negative
+        // ticket -- dropped it, leaving B's caller suspended for ever.
+
+        test testTwoPoolsDoNotStealAnswers() {
+            WebPoolTests.reset()
+            var port = WebPoolTests.takePort()
+            var server = WebPoolTests.startServer(port, 2)
+
+            var a = new WebPool(1)
+            var b = new WebPool(1)
+            WebPoolTests.fire(a, WebPoolTests.url(port))
+            WebPoolTests.fire(b, WebPoolTests.url(port))
+
+            var spins = 0
+            while (WebPoolTests.answers.getSize() < 2 && spins < 1500) {
+                a.drain()
+                b.drain()
+                Thread.sleep(10L)
+                spins = spins + 1
+            }
+            Assert.assertEquals(2, WebPoolTests.answers.getSize())
+            Assert.assertEquals(200, WebPoolTests.answers.get(0).status)
+            Assert.assertEquals(200, WebPoolTests.answers.get(1).status)
+
+            a.close()
+            b.close()
+            server.join()
+        }
+
+        // ---- the static front door ----------------------------------------
+
+        test testStaticApiUsesOnePoolPerIsolate() {
+            WebPoolTests.reset()
+            var port = WebPoolTests.takePort()
+            var server = WebPoolTests.startServer(port, 3)
+
+            WebPool.setMaxWorkers(2)
+            Assert.assertEquals(2, WebPool.getMaxWorkers())
+            Assert.assertEquals(1, WebPool.getConnectionsPerWorker())
+
+            var i = 0
+            while (i < 3) {
+                WebPoolTests.fireStatic(WebPoolTests.url(port))
+                i = i + 1
+            }
+            Assert.assertEquals(2, WebPool.workers())
+            Assert.assertEquals(1, WebPool.queuedRequests())
+
+            Assert.assertEquals(3, WebPoolTests.drainStaticUntil(3))
+            Assert.assertEquals("pool-ok", WebPoolTests.answers.get(0).body)
+            Assert.assertEquals(0, WebPool.activeRequests())
+
+            WebPool.shutdown()
+            server.join()
+        }
+
+        // ---- one worker carrying several connections ----------------------
+        //
+        // The multiplexed mode: capacity above 1 makes a worker run its own
+        // reactor. Asserted on workerCount, so it cannot pass by accidentally
+        // starting three workers instead.
+
+        test testOneWorkerCarriesSeveralConnections() {
+            WebPoolTests.reset()
+            var port = WebPoolTests.takePort()
+            var server = WebPoolTests.startServer(port, 3)
+
+            var pool = new WebPool(1)
+            pool.connectionsPerWorker = 3
+            var i = 0
+            while (i < 3) {
+                WebPoolTests.fire(pool, WebPoolTests.url(port))
+                i = i + 1
+            }
+            // All three accepted at once by the single worker: nothing queued.
+            Assert.assertEquals(1, pool.workerCount())
+            Assert.assertEquals(3, pool.activeCount())
+            Assert.assertEquals(0, pool.queuedCount())
+
+            Assert.assertEquals(3, WebPoolTests.drainUntil(pool, 3))
+            Assert.assertEquals(200, WebPoolTests.answers.get(0).status)
+            Assert.assertEquals(200, WebPoolTests.answers.get(1).status)
+            Assert.assertEquals(200, WebPoolTests.answers.get(2).status)
+            Assert.assertEquals(1, pool.workerCount())
+
+            pool.close()
+            server.join()
+        }
+
+        // ---- a download is written on the worker, not carried back --------
+        //
+        // Regression: a multiplexing worker ignored savePath entirely -- the
+        // reactor has no download path, so the file was never written and the
+        // body came back in memory instead.
+
+        test testDownloadWritesTheFileInMultiplexedMode() {
+            WebPoolTests.reset()
+            var port = WebPoolTests.takePort()
+            var server = WebPoolTests.startServer(port, 1)
+
+            var target = File.joinPath(File.getSystemTempFolder(), "webpool-download.txt")
+            File.delete(target)
+
+            var pool = new WebPool(1)
+            pool.connectionsPerWorker = 3
+            WebPoolTests.download(pool, WebPoolTests.url(port), target)
+            Assert.assertEquals(1, WebPoolTests.drainUntil(pool, 1))
+
+            Assert.assertEquals(200, WebPoolTests.answers.get(0).status)
+            var written = new File(target)
+            Assert.assertTrue(written.exists())
+            var stream = new FileStream(written, FileAccess.readOnly)
+            var bytes = stream.readAll()
+            stream.close()
+            Assert.assertEquals("pool-ok", String.fromBytes(bytes, "UTF-8"))
+
+            File.delete(target)
+            pool.close()
+            server.join()
+        }
+
+        // ---- a dead peer is an answer, not an exception --------------------
+
+        test testTransportFailureArrivesInTheAnswer() {
+            WebPoolTests.reset()
+            // Nothing listening here: no server started.
+            var port = WebPoolTests.takePort()
+
+            var pool = new WebPool(1)
+            WebPoolTests.fire(pool, WebPoolTests.url(port))
+            Assert.assertEquals(1, WebPoolTests.drainUntil(pool, 1))
+
+            var answer = WebPoolTests.answers.get(0)
+            Assert.assertTrue(answer.error.length() > 0)
+            Assert.assertEquals(0, answer.status)
+            Assert.assertFalse(answer.isSuccess())
+
+            pool.close()
+        }
+    }
+}

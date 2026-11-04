@@ -1,66 +1,483 @@
 namespace Am.Web.Client.Experimental {
-    // Caller-local handle over the shared Mac reactor manager. Callbacks stay
-    // on their creating isolate; each connection stays on its assigned worker.
-    #implementationPlatforms "libc", "macos-arm"
-    native class HttpReactor() {
+
+    // One connection the reactor is driving, and where it has got to.
+    class ReactorConnection(var id: Am.Lang.Int, var host: Am.Lang.String,
+                            var port: Am.Lang.Int, var path: Am.Lang.String,
+                            var tls: Am.Lang.Bool) {
+        import Am.Lang
+        import Am.Net
+        import Am.Net.Ssl
+
+        static const CONNECTING: Int = 0
+        static const HANDSHAKING: Int = 1
+        static const SENDING: Int = 2
+        static const RECEIVING: Int = 3
+        static const DONE: Int = 4
+        static const FAILED: Int = 5
+
+        var state: Int = ReactorConnection.CONNECTING
+        var socket: Socket? = null
+        var session: SslPollSession? = null
+        var error: String = ""
+
+        // What this connection is waiting for, in SocketPoll bits. Recomputed
+        // every step, because TLS can want readability in the middle of a
+        // write and a reactor that assumes otherwise hangs.
+        var want: Int = 0
+
+        var request: UByte[]? = null
+        var sentBytes: Int = 0
+
+        // Response bytes, grown by doubling. A List<UByte> would cost an
+        // object per byte.
+        var buffer: UByte[] = new UByte[4096UI]
+        var filled: Int = 0
+
+        // Wall-clock instant this connection gives up at. A deadline per
+        // connection is what makes a SHORT poll safe: an empty select means
+        // "nothing happened yet", not "everyone timed out", so a caller can
+        // call advance(0) in a UI loop without killing requests that are
+        // merely still in flight.
+        var deadline: ULong = 0UL
+
+        fun isTerminal(): Bool {
+            return this.state == ReactorConnection.DONE || this.state == ReactorConnection.FAILED
+        }
+
+        fun fail(message: String) {
+            this.error = message
+            this.state = ReactorConnection.FAILED
+            this.want = 0
+        }
+
+        fun ensureRoom(extra: Int) {
+            var needed = this.filled + extra
+            if (needed <= (this.buffer.length() as Int)) { return }
+            var size = this.buffer.length() as Int
+            while (size < needed) { size = size * 2 }
+            var bigger = new UByte[size as UInt]
+            this.buffer.copyTo(bigger, 0UI, 0UI, this.filled as UInt)
+            this.buffer = bigger
+        }
+
+        // Everything received so far, exactly `filled` long.
+        fun raw(): UByte[] {
+            var out = new UByte[this.filled as UInt]
+            this.buffer.copyTo(out, 0UI, 0UI, this.filled as UInt)
+            return out
+        }
+    }
+
+    /**
+     * Many HTTP(S) requests in flight on ONE thread.
+     *
+     * Pure AmLang over two primitives: Am.Net.SocketPoll decides which
+     * connections can move, and Am.Net.Ssl.SslPollSession carries TLS without
+     * blocking. There is no native code here and no thread per request, which
+     * is what the previous implementation needed 580 lines of Mac-only C for.
+     *
+     * NOTHING IN HERE WAITS unless the caller asks it to. `ready` advances
+     * every connection as far as it can with a zero timeout and then answers;
+     * `waitAny` is the only call that blocks, and only for as long as it is
+     * told. So `pump` can be called from an event loop without stalling it.
+     *
+     * Platform support follows the two primitives: libc today. The API above
+     * does not change when AmigaOS gains WaitSelect and AmiSSL versions.
+     */
+    class HttpReactor {
         import Am.Lang
         import Am.IO
         import Am.Collections
+        import Am.Net
+        import Am.Net.Ssl
         import Am.Web.Client
-        // Shared native configuration, not isolate-local static storage.
-        native static fun setMaxThreads(maximum: Int)
-        native static fun getMaxThreads(): Int
-        native static fun workerCount(): Int
-        private var callbacks: List<ReactorCallback> = new List<ReactorCallback>()
+
+        // Kept for source compatibility with the native reactor this replaces.
+        // There are no worker threads any more: everything runs on the caller's
+        // thread, so the limit is on CONCURRENT CONNECTIONS, and workerCount is
+        // how many are currently live.
+        private static var maxConcurrent: Int = 16
+        static fun setMaxThreads(maximum: Int) { HttpReactor.maxConcurrent = maximum }
+        static fun getMaxThreads(): Int { return HttpReactor.maxConcurrent }
+        static fun workerCount(): Int { return HttpReactor.liveCount }
+        private static var liveCount: Int = 0
+
         var maxResponseBytes: Int = 2097152
-        private native fun setLimitNative(limit: Int)
         var timeoutMilliseconds: Int = 10000
+
+        private var connections: List<ReactorConnection> = new List<ReactorConnection>()
+        private var callbacks: List<ReactorCallback> = new List<ReactorCallback>()
+        private var nextId: Int = 1
+
+        /** A plain GET, which is all most callers want. */
         fun submit(url: String): Int {
-            if (!url.startsWith("http://") && !url.startsWith("https://")) { throw new Exception("Expected HTTP(S) URL") }
-            this.setLimitNative(this.maxResponseBytes)
-            var parser = new UrlParser()
-            return this.submitNative(parser.extractHost(url), parser.extractPort(url), parser.extractPath(url), parser.isHttps(url), this.timeoutMilliseconds)
+            return this.submitRequest("GET", url, "", new HashMap<String, String>())
         }
-        private native fun submitNative(host: String, port: Int, path: String, tls: Bool, timeout: Int): Int
-        native fun ready(id: Int): Int
-        // Wait for any terminal request without consuming messages/callbacks.
-        native fun waitAny(timeoutMilliseconds: Int): Int
-        native fun takeRaw(id: Int): UByte[]
-        native fun cancel(id: Int)
-        private native fun closeNative()
-        fun close() { this.closeNative()
-            this.callbacks = new List<ReactorCallback>() }
+
+        /**
+         * Any method, with headers and a body.
+         *
+         * Separate name rather than an overload: amlc's overload resolution is
+         * not reliable, so the two entry points are named apart on purpose.
+         *
+         * The request is HTTP/1.0 with `Connection: close`, so the response
+         * ends at EOF and no keepalive bookkeeping is needed. A caller's own
+         * Host, Content-Length or Connection header is ignored -- those three
+         * are ours to get right.
+         */
+        fun submitRequest(method: String, url: String, body: String,
+                          headers: HashMap<String, String>): Int {
+            if (!url.startsWith("http://") && !url.startsWith("https://")) {
+                throw new Exception("Expected HTTP(S) URL")
+            }
+            var parser = new UrlParser()
+            var connection = new ReactorConnection(this.nextId, parser.extractHost(url),
+                parser.extractPort(url), parser.extractPath(url), parser.isHttps(url))
+            this.nextId = this.nextId + 1
+
+            var socket = Socket.create(AddressFamily.inet, SocketType.stream, ProtocolFamily.unspecified)
+            SocketPoll.setNonBlocking(socket, true)
+            connection.socket = socket
+
+            var text = new StringBuilder()
+            text.add(method).add(" ").add(connection.path).add(" HTTP/1.0\r\n")
+            text.add("Host: ").add(connection.host).add("\r\n")
+            text.add("Connection: close\r\n")
+            // buildKeys(), not keys(): keys() on a HashMap-typed local trips
+            // the compiler ("Can't inject as operator on expression"), as
+            // WebClient notes at its own header loop.
+            var names = headers.buildKeys()
+            var h = 0
+            while (h < names.getSize()) {
+                var name = names.get(h)
+                var lower = name.toLowerCase()
+                if (!lower.equals("host") && !lower.equals("content-length") &&
+                    !lower.equals("connection")) {
+                    text.add(name).add(": ").add(headers.get(name)).add("\r\n")
+                }
+                h = h + 1
+            }
+            if (body.length() > 0) {
+                text.add("Content-Length: ").add(body.length().toString()).add("\r\n")
+            }
+            text.add("\r\n")
+            if (body.length() > 0) { text.add(body) }
+            connection.request = text.toString().toBytes("UTF-8")
+
+            var connected = SocketPoll.startConnect(socket, connection.host, connection.port)
+            if (connected) { this.beginAfterConnect(connection) }
+            else {
+                connection.state = ReactorConnection.CONNECTING
+                connection.want = SocketPoll.WRITE
+            }
+
+            connection.deadline = DateTime.now().getEpochMillis() +
+                (this.timeoutMilliseconds as ULong)
+            this.connections.add(connection)
+            HttpReactor.liveCount = HttpReactor.liveCount + 1
+            return connection.id
+        }
+
+        // A connected socket either starts the TLS handshake or goes straight
+        // to sending.
+        private fun beginAfterConnect(connection: ReactorConnection) {
+            if (connection.tls) {
+                var socket = connection.socket as Socket
+                connection.session = new SslPollSession(socket, connection.host)
+                connection.state = ReactorConnection.HANDSHAKING
+                connection.want = SocketPoll.READ | SocketPoll.WRITE
+            } else {
+                connection.state = ReactorConnection.SENDING
+                connection.want = SocketPoll.WRITE
+            }
+        }
+
+        /**
+         * Advances every live connection as far as it can without waiting
+         * longer than `timeoutMilliseconds` for readiness. 0 polls.
+         * @return the number of connections that became terminal
+         */
+        fun advance(timeoutMilliseconds: Int): Int {
+            var waiting = new List<ReactorConnection>()
+            var index = 0
+            while (index < this.connections.getSize()) {
+                var c = this.connections.get(index)
+                if (!c.isTerminal() && c.want != 0) { waiting.add(c) }
+                index++
+            }
+            if (waiting.getSize() == 0) { return 0 }
+
+            var count = waiting.getSize()
+            var sockets = new Socket[count as UInt]
+            var want = new Int[count as UInt]
+            var ready = new Int[count as UInt]
+            var i = 0
+            while (i < count) {
+                var c = waiting.get(i)
+                sockets[i] = c.socket as Socket
+                want[i] = c.want
+                i++
+            }
+
+            SocketPoll.wait(sockets, want, ready, timeoutMilliseconds)
+
+            var terminal = 0
+            var j = 0
+            while (j < count) {
+                var c = waiting.get(j)
+                if (ready[j] != 0) {
+                    this.step(c, ready[j])
+                    if (c.isTerminal()) { terminal = terminal + 1 }
+                }
+                j++
+            }
+
+            // Only a connection past its own deadline times out.
+            var nowMillis = DateTime.now().getEpochMillis()
+            var k = 0
+            while (k < count) {
+                var c = waiting.get(k)
+                if (!c.isTerminal() && nowMillis > c.deadline) {
+                    c.fail("the request timed out")
+                    terminal = terminal + 1
+                }
+                k++
+            }
+            return terminal
+        }
+
+        // One step for one connection, given what it is ready for.
+        private fun step(connection: ReactorConnection, ready: Int) {
+            if (connection.state == ReactorConnection.CONNECTING) {
+                var socket = connection.socket as Socket
+                if (SocketPoll.connectError(socket) != 0) {
+                    connection.fail("could not connect to " + connection.host)
+                    return
+                }
+                this.beginAfterConnect(connection)
+                return
+            }
+
+            if (connection.state == ReactorConnection.HANDSHAKING) {
+                var session = connection.session as SslPollSession
+                var state = session.handshake()
+                if (state == SslPollSession.OK) {
+                    connection.state = ReactorConnection.SENDING
+                    connection.want = SocketPoll.WRITE
+                } else {
+                    if (state == SslPollSession.WANT_READ) { connection.want = SocketPoll.READ }
+                    else {
+                        if (state == SslPollSession.WANT_WRITE) { connection.want = SocketPoll.WRITE }
+                        else { connection.fail("the TLS handshake failed") }
+                    }
+                }
+                return
+            }
+
+            if (connection.state == ReactorConnection.SENDING) {
+                this.stepSend(connection)
+                return
+            }
+
+            if (connection.state == ReactorConnection.RECEIVING) {
+                this.stepReceive(connection)
+                return
+            }
+        }
+
+        private fun stepSend(connection: ReactorConnection) {
+            var request = connection.request as UByte[]
+            var remaining = (request.length() as Int) - connection.sentBytes
+            if (remaining <= 0) {
+                connection.state = ReactorConnection.RECEIVING
+                connection.want = SocketPoll.READ
+                return
+            }
+            if (connection.tls) {
+                var session = connection.session as SslPollSession
+                var n = session.send(request, connection.sentBytes as Long, remaining as UInt)
+                if (n > 0) { connection.sentBytes = connection.sentBytes + n }
+                else {
+                    if (n == SslPollSession.WANT_READ) { connection.want = SocketPoll.READ }
+                    else {
+                        if (n == SslPollSession.WANT_WRITE) { connection.want = SocketPoll.WRITE }
+                        else { connection.fail("the TLS write failed")
+                            return }
+                    }
+                }
+            } else {
+                var socket = connection.socket as Socket
+                var n = SocketPoll.send(socket, request, connection.sentBytes as Long, remaining as UInt)
+                if (n > 0) { connection.sentBytes = connection.sentBytes + n }
+                else {
+                    if (n == SocketPoll.AGAIN) { connection.want = SocketPoll.WRITE }
+                    else { connection.fail("the request could not be sent")
+                        return }
+                }
+            }
+            if (connection.sentBytes >= (request.length() as Int)) {
+                connection.state = ReactorConnection.RECEIVING
+                connection.want = SocketPoll.READ
+            }
+        }
+
+        private fun stepReceive(connection: ReactorConnection) {
+            connection.ensureRoom(4096)
+            var room = (connection.buffer.length() as Int) - connection.filled
+            if (connection.tls) {
+                var session = connection.session as SslPollSession
+                var n = session.receive(connection.buffer, connection.filled as Long, room as UInt)
+                if (n > 0) { connection.filled = connection.filled + n }
+                else {
+                    if (n == SslPollSession.CLOSED) { connection.state = ReactorConnection.DONE
+                        connection.want = 0 }
+                    else {
+                        if (n == SslPollSession.WANT_READ) { connection.want = SocketPoll.READ }
+                        else {
+                            if (n == SslPollSession.WANT_WRITE) { connection.want = SocketPoll.WRITE }
+                            else { connection.fail("the TLS read failed") }
+                        }
+                    }
+                }
+            } else {
+                var socket = connection.socket as Socket
+                var n = SocketPoll.receive(socket, connection.buffer, connection.filled as Long, room as UInt)
+                if (n > 0) { connection.filled = connection.filled + n }
+                else {
+                    // CLOSED is how both transports say "that was the whole
+                    // body": HTTP/1.0 with Connection: close ends at EOF.
+                    if (n == SocketPoll.CLOSED) { connection.state = ReactorConnection.DONE
+                        connection.want = 0 }
+                    else {
+                        if (n == SocketPoll.AGAIN) { connection.want = SocketPoll.READ }
+                        else { connection.fail("the response could not be read") }
+                    }
+                }
+            }
+            if (connection.filled > this.maxResponseBytes) {
+                connection.fail("the response exceeded maxResponseBytes")
+            }
+        }
+
+        private fun find(id: Int): ReactorConnection? {
+            var i = 0
+            while (i < this.connections.getSize()) {
+                var c = this.connections.get(i)
+                if (c.id == id) { return c }
+                i++
+            }
+            return null
+        }
+
+        /** 1 once the request has finished or failed, 0 while it is in flight. */
+        fun ready(id: Int): Int {
+            this.advance(0)
+            var c = this.find(id)
+            if (c == null) { return 0 }
+            if ((c as ReactorConnection).isTerminal()) { return 1 }
+            return 0
+        }
+
+        /** Waits up to the timeout for any request to finish. */
+        fun waitAny(timeoutMilliseconds: Int): Int {
+            return this.advance(timeoutMilliseconds)
+        }
+
+        fun takeRaw(id: Int): UByte[] {
+            var found = this.find(id)
+            if (found == null) { throw new Exception("No such request") }
+            var c = found as ReactorConnection
+            while (!c.isTerminal()) { this.advance(this.timeoutMilliseconds) }
+            this.release(c)
+            if (c.state == ReactorConnection.FAILED) { throw new Exception(c.error) }
+            return c.raw()
+        }
+
+        private fun release(connection: ReactorConnection) {
+            var session = connection.session
+            if (session != null) { (session as SslPollSession).close()
+                connection.session = null }
+            var socket = connection.socket
+            if (socket != null) { (socket as Socket).close()
+                connection.socket = null }
+            var i = 0
+            while (i < this.connections.getSize()) {
+                if (this.connections.get(i).id == connection.id) {
+                    this.connections.removeAt(i)
+                    HttpReactor.liveCount = HttpReactor.liveCount - 1
+                    return
+                }
+                i++
+            }
+        }
+
+        fun cancel(id: Int) {
+            var found = this.find(id)
+            if (found != null) {
+                var c = found as ReactorConnection
+                c.fail("cancelled")
+                this.release(c)
+            }
+        }
+
+        fun close() {
+            while (this.connections.getSize() > 0) {
+                this.release(this.connections.get(0))
+            }
+            this.callbacks = new List<ReactorCallback>()
+        }
+
         fun get(url: String): HttpResponse {
             return this.take(this.submit(url))
         }
+
         fun take(id: Int): HttpResponse {
             var raw = this.takeRaw(id)
             var stream = new ResponseByteStream(raw)
             var reader = new StreamReader(stream as Stream)
             return WebClient.readResponse(reader, this.maxResponseBytes)
         }
+
         fun getAsync(url: String, callback: (ReactorResult) => Bool): Int {
             var id = this.submit(url)
             this.callbacks.add(new ReactorCallback(id, callback))
             return id
         }
-        // Explicit pump: lambdas stay on the caller and never run inline at
-        // submission or while a synchronous take waits on its own condition.
+
+        // Explicit pump: callbacks run on the caller's thread, never inline at
+        // submission.
         fun pump() {
+            this.advance(0)
             var index = 0
             while (index < this.callbacks.getSize()) {
                 var entry = this.callbacks.get(index)
-                if (this.ready(entry.id) == 0) { index++ }
-                else {
+                // isTerminal(), not ready(): ready() advances, and advancing
+                // once per registered callback would mean one select() per
+                // callback per pump.
+                var c = this.find(entry.id)
+                if (c == null) {
+                    // cancel() or close() took the connection out from under a
+                    // registered callback. Answering it with an error is the
+                    // only way the caller's continuation is ever resumed; a
+                    // callback left in the list would wait forever.
                     this.callbacks.removeAt(index)
-                    var result = new ReactorResult(entry.id)
-                    try { result.response = this.take(entry.id) }
-                    catch (e: Exception) { result.error = e.message }
-                    entry.callback(result)
+                    var gone = new ReactorResult(entry.id)
+                    gone.error = "the request was cancelled"
+                    entry.callback(gone)
+                } else {
+                    if (!(c as ReactorConnection).isTerminal()) { index++ }
+                    else {
+                        this.callbacks.removeAt(index)
+                        var result = new ReactorResult(entry.id)
+                        try { result.response = this.take(entry.id) }
+                        catch (e: Exception) { result.error = e.message }
+                        entry.callback(result)
+                    }
                 }
             }
         }
     }
+
     class ReactorCallback(var id: Am.Lang.Int, var callback: (ReactorResult) => Am.Lang.Bool) { }
     class ReactorResult(var id: Am.Lang.Int) {
         var response: Am.Web.Client.HttpResponse? = null
